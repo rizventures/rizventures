@@ -646,221 +646,277 @@ document.addEventListener("change",e=>{let id=e.target.dataset.uploadMore;if(id)
 document.addEventListener("input",e=>{if(e.target.id==="search")render();});
 
 
-
-/* === RIZ DOCUMENT CLOUD SYNC PATCH V1 ===
-   This fixes phone upload not showing on PC.
-   It uploads files to Supabase Storage and saves document metadata to table riz_documents.
-*/
-const RIZ_DOC_BUCKET = "riz-documents";
-const RIZ_DOC_TABLE = "riz_documents";
-const RIZ_DOC_SETUP_SQL = `
--- Run once in Supabase SQL Editor if document sync says table/bucket missing
-insert into storage.buckets (id, name, public)
-values ('riz-documents', 'riz-documents', true)
-on conflict (id) do update set public = true;
-
-create table if not exists public.riz_documents (
-  id uuid primary key default gen_random_uuid(),
-  doc_key text unique,
-  date text,
-  brand text,
-  name text,
-  type text,
-  status text,
-  note text,
-  files jsonb default '[]'::jsonb,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-
-alter table public.riz_documents enable row level security;
-drop policy if exists "allow riz_documents all" on public.riz_documents;
-create policy "allow riz_documents all" on public.riz_documents for all using (true) with check (true);
-
-create policy if not exists "allow riz-documents storage select" on storage.objects for select using (bucket_id = 'riz-documents');
-create policy if not exists "allow riz-documents storage insert" on storage.objects for insert with check (bucket_id = 'riz-documents');
-create policy if not exists "allow riz-documents storage update" on storage.objects for update using (bucket_id = 'riz-documents') with check (bucket_id = 'riz-documents');
-create policy if not exists "allow riz-documents storage delete" on storage.objects for delete using (bucket_id = 'riz-documents');
-`;
-
-function rizDocSafePath(s){return String(s||'file').replace(/[^a-zA-Z0-9._-]+/g,'_').slice(0,120)}
-function rizDocCloudId(id){return String(id||'').startsWith('SBDOC-') ? String(id).replace('SBDOC-','') : null}
-function rizDocShowSetupAlert(err){
-  console.warn('Document sync setup needed:', err);
-  rizSetStatus('Document cloud sync setup needed', false);
-  const msg = 'Document sync needs Supabase table/storage setup. Open Console to copy SQL, or ask me for SQL setup file.\n\nError: ' + (err?.message || err || 'Unknown');
-  if(!window.__rizDocSetupShown){ window.__rizDocSetupShown=true; console.log('COPY THIS SQL FOR DOCUMENT SYNC:\n', RIZ_DOC_SETUP_SQL); alert(msg); }
-}
-
-async function rizUploadDocumentFile(file, brand){
-  if(!rizSB || !file) throw new Error('Supabase not connected');
-  const safeName = rizDocSafePath(file.name || 'document');
-  const path = `${rizDocSafePath(brand||'all')}/${Date.now()}_${Math.random().toString(36).slice(2)}_${safeName}`;
-  const { error } = await rizSB.storage.from(RIZ_DOC_BUCKET).upload(path, file, { upsert:false, contentType:file.type || 'application/octet-stream' });
-  if(error) throw error;
-  const { data: pub } = rizSB.storage.from(RIZ_DOC_BUCKET).getPublicUrl(path);
-  return { key:'sb:'+path, path, bucket:RIZ_DOC_BUCKET, url:pub.publicUrl, name:file.name, type:file.type||'file', size:file.size||0, cloud:true };
-}
-
-async function prepareFiles(list){
-  const files = Array.from(list||[]);
-  const out=[];
-  for(const f of files){
-    try{ out.push(await rizUploadDocumentFile(f, activeBrand==='all'?'all':activeBrand)); }
-    catch(err){
-      console.warn('Supabase Storage upload failed, using local fallback:', err);
-      let key='f_'+Date.now()+'_'+Math.random().toString(36).slice(2);
-      await putFile(key,f);
-      out.push({key,name:f.name,type:f.type||'file',size:f.size||0,localOnly:true});
-      rizDocShowSetupAlert(err);
-    }
-  }
-  return out;
-}
-
-async function rizSaveDocCloud(doc){
-  if(!rizSB || !doc) return false;
-  const payload = {
-    doc_key: String(doc.id),
-    date: doc.date || today(),
-    brand: doc.brand || 'all',
-    name: doc.name || 'Document',
-    type: doc.type || '',
-    status: doc.status || 'Active',
-    note: doc.note || '',
-    files: doc.files || [],
-    updated_at: new Date().toISOString()
-  };
-  let q;
-  const cloudId = rizDocCloudId(doc.id);
-  if(cloudId) q = await rizSB.from(RIZ_DOC_TABLE).update(payload).eq('id', cloudId).select('id').single();
-  else q = await rizSB.from(RIZ_DOC_TABLE).upsert(payload, { onConflict:'doc_key' }).select('id').single();
-  if(q.error){ rizDocShowSetupAlert(q.error); return false; }
-  if(q.data?.id) doc.id = 'SBDOC-' + q.data.id;
-  localStorage.setItem(KEY, JSON.stringify(data));
-  rizSetStatus('Document synced to Supabase', true);
-  return true;
-}
-
-async function rizDeleteDocCloud(doc){
-  if(!rizSB || !doc) return;
-  for(const f of (doc.files||[])){
-    if(f.path) await rizSB.storage.from(RIZ_DOC_BUCKET).remove([f.path]).catch(()=>{});
-  }
-  const cloudId = rizDocCloudId(doc.id);
-  if(cloudId) await rizSB.from(RIZ_DOC_TABLE).delete().eq('id', cloudId);
-  else await rizSB.from(RIZ_DOC_TABLE).delete().eq('doc_key', String(doc.id));
-}
-
-async function rizPullDocumentsFromSupabase(){
-  if(!rizSB) return;
-  const {data:docs, error} = await rizSB.from(RIZ_DOC_TABLE).select('*').order('created_at', { ascending:false });
-  if(error){ console.warn('Document cloud pull skipped:', error); return; }
-  const cloudDocs = (docs||[]).map(d=>({
-    id:'SBDOC-'+d.id,
-    date:d.date || (d.created_at||'').slice(0,10) || today(),
-    brand:d.brand || 'all',
-    name:d.name || 'Document',
-    type:d.type || '',
-    status:d.status || 'Active',
-    note:d.note || '',
-    files:Array.isArray(d.files) ? d.files : []
-  }));
-  const localOnly = (data.documents||[]).filter(d=>!String(d.id).startsWith('SBDOC-') && !(d.files||[]).some(f=>f.cloud));
-  data.documents = [...cloudDocs, ...localOnly];
-  localStorage.setItem(KEY, JSON.stringify(data));
-  renderDocuments();
-}
-
-async function addDoc(p){
-  let brand=activeBrand==='all'?'all':activeBrand;
-  let o={id:'DOC-'+Date.now(),date:val(p+'date')||today(),brand,name:val(p+'name'),type:val(p+'type'),status:val(p+'status'),note:val(p+'note'),files:[]};
-  if(!o.name)return alert('Fill document title.');
-  try{
-    o.files=await prepareFiles(document.getElementById(p+'file').files);
-    data.documents.unshift(o);
-    await rizSaveDocCloud(o);
-    save();closeModal();render();
-  }catch(e){ console.error(e); alert('Upload failed: '+(e.message||e)); }
-}
-
-async function uploadMore(e,id){
-  let doc=data.documents.find(d=>String(d.id)===String(id));
-  if(!doc)return;
-  try{
-    doc.files = doc.files || [];
-    doc.files.push(...await prepareFiles(e.target.files));
-    await rizSaveDocCloud(doc);
-    save();render();
-  }catch(err){ console.error(err); alert('Upload failed: '+(err.message||err)); }
-}
-
-async function viewFile(id,i){
-  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];
-  if(!f)return;
-  if(f.url){ window.open(f.url, '_blank'); return; }
-  if(f.path && rizSB){ const {data:pub}=rizSB.storage.from(f.bucket||RIZ_DOC_BUCKET).getPublicUrl(f.path); window.open(pub.publicUrl,'_blank'); return; }
-  let blob=await getFile(f.key); if(!blob)return alert('File not found in browser. This was saved before cloud sync. Upload it again to sync across devices.');
-  let url=URL.createObjectURL(blob),w=window.open('');
-  if((f.type||'').startsWith('image/'))w.document.write(`<img src="${url}" style="max-width:100%;max-height:100vh;display:block;margin:auto">`);
-  else if((f.type||'').includes('pdf'))w.document.write(`<iframe src="${url}" style="border:0;width:100%;height:100vh"></iframe>`);
-  else w.document.write(`<a href="${url}" download="${esc(f.name)}">Download ${esc(f.name)}</a>`);
-}
-
-async function downloadFile(id,i){
-  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i]; if(!f)return;
-  if(f.url || f.path){
-    const url=f.url || rizSB.storage.from(f.bucket||RIZ_DOC_BUCKET).getPublicUrl(f.path).data.publicUrl;
-    let a=document.createElement('a'); a.href=url; a.download=f.name||'document'; a.target='_blank'; a.click(); return;
-  }
-  let blob=await getFile(f.key); if(!blob)return alert('File not found in browser.');
-  let url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
-}
-
-async function removeFile(id,i){
-  let d=data.documents.find(x=>String(x.id)===String(id)); if(!d?.files?.[i])return;
-  if(confirm('Remove file?')){
-    const f=d.files[i];
-    if(f.path && rizSB) await rizSB.storage.from(f.bucket||RIZ_DOC_BUCKET).remove([f.path]).catch(()=>{});
-    else if(f.key) await delFile(f.key).catch(()=>{});
-    d.files.splice(i,1);
-    await rizSaveDocCloud(d);
-    save();render();
-  }
-}
-
-// Capture document delete to remove cloud files too
-(function(){
-  document.addEventListener('click', async function(e){
-    const del=e.target.closest('[data-del]');
-    if(!del) return;
-    const [t,id]=String(del.dataset.del||'').split(':');
-    if(t==='documents'){
-      e.preventDefault(); e.stopImmediatePropagation();
-      if(!confirm('Delete this document and cloud files?')) return;
-      const doc=data.documents.find(x=>String(x.id)===String(id));
-      if(doc) await rizDeleteDocCloud(doc);
-      data.documents=data.documents.filter(x=>String(x.id)!==String(id));
-      save(); render();
-    }
-  }, true);
-})();
-
-// Extend init and realtime for documents
-const __oldInitRizSupabase = initRizSupabase;
-function initRizSupabase(){
-  __oldInitRizSupabase();
-  setTimeout(()=>rizPullDocumentsFromSupabase(), 1200);
-  if(rizSB){
-    try{
-      rizSB.channel('riz-documents-live-sync')
-        .on('postgres_changes',{event:'*',schema:'public',table:RIZ_DOC_TABLE},()=>rizPullDocumentsFromSupabase())
-        .subscribe();
-    }catch(e){ console.warn(e); }
-  }
-}
-
 initRizSupabase();
 </script>
+
+<style>
+/* RIZ CLOUD DOCUMENT SYNC PANEL */
+.riz-doc-floating-btn{
+  position:fixed; right:18px; bottom:76px; z-index:99998;
+  border:0; border-radius:999px; padding:13px 16px; font-weight:900;
+  background:#111827; color:white; box-shadow:0 10px 30px rgba(0,0,0,.22);
+  cursor:pointer;
+}
+.riz-doc-panel{
+  position:fixed; right:18px; bottom:132px; width:min(420px, calc(100vw - 24px));
+  max-height:70vh; overflow:hidden; display:none; flex-direction:column;
+  background:white; z-index:99999; border-radius:24px; box-shadow:0 18px 55px rgba(0,0,0,.28);
+  border:1px solid rgba(15,23,42,.08); font-family:inherit;
+}
+.riz-doc-panel.open{display:flex;}
+.riz-doc-head{padding:18px 18px 12px; background:#111827; color:white;}
+.riz-doc-head h3{margin:0; font-size:1.1rem;}
+.riz-doc-head p{margin:5px 0 0; color:#cbd5e1; font-size:.8rem; font-weight:700;}
+.riz-doc-body{padding:14px; overflow-y:auto;}
+.riz-doc-upload-box{
+  border:2px dashed #f97316; background:#fff7ed; border-radius:18px; padding:14px; margin-bottom:12px;
+}
+.riz-doc-upload-box input,.riz-doc-upload-box select{
+  width:100%; padding:10px; border-radius:12px; border:1px solid #fed7aa; margin-bottom:8px; font-weight:800;
+}
+.riz-doc-upload-box button,.riz-doc-refresh{
+  width:100%; border:0; border-radius:13px; padding:12px; font-weight:900; background:#f97316; color:white; cursor:pointer;
+}
+.riz-doc-refresh{background:#111827; margin-bottom:10px;}
+.riz-doc-status{font-size:.78rem; font-weight:900; color:#64748b; margin:8px 0;}
+.riz-doc-list{display:flex; flex-direction:column; gap:10px;}
+.riz-doc-card{border:1px solid #e5e7eb; border-radius:16px; padding:12px; background:#f8fafc;}
+.riz-doc-card b{display:block; color:#111827; word-break:break-word;}
+.riz-doc-card small{display:block; color:#64748b; font-weight:800; margin:5px 0 9px;}
+.riz-doc-actions{display:flex; gap:8px; flex-wrap:wrap;}
+.riz-doc-actions a,.riz-doc-actions button{
+  border:0; border-radius:10px; padding:8px 10px; font-size:.78rem; font-weight:900; text-decoration:none; cursor:pointer;
+}
+.riz-doc-actions a{background:#111827; color:white;}
+.riz-doc-actions button{background:#ef4444; color:white;}
+@media(max-width:700px){
+  .riz-doc-panel{right:8px; left:8px; bottom:118px; width:auto; max-height:72vh;}
+  .riz-doc-floating-btn{right:12px; bottom:74px;}
+}
+</style>
+
+<button class="riz-doc-floating-btn" onclick="toggleRizDocPanel()">📁 Documents</button>
+
+<div id="riz-doc-panel" class="riz-doc-panel">
+  <div class="riz-doc-head">
+    <h3>Cloud Documents</h3>
+    <p>Upload sini akan sync phone ↔ PC melalui Supabase Storage.</p>
+  </div>
+  <div class="riz-doc-body">
+    <div class="riz-doc-upload-box">
+      <select id="riz-doc-brand">
+        <option value="All Brands">All Brands</option>
+        <option value="CRAVO FRIED CHICKEN">CRAVO FRIED CHICKEN</option>
+        <option value="CRUNCH LAB">CRUNCH LAB</option>
+        <option value="KAVYX">KAVYX</option>
+        <option value="SDERLLA VECTOR PRINT">SDERLLA VECTOR PRINT</option>
+      </select>
+      <input id="riz-doc-file" type="file" multiple />
+      <button onclick="uploadRizDocuments()">UPLOAD TO CLOUD</button>
+      <div id="riz-doc-status" class="riz-doc-status">Ready.</div>
+    </div>
+    <button class="riz-doc-refresh" onclick="loadRizDocuments()">🔄 Refresh Documents</button>
+    <div id="riz-doc-list" class="riz-doc-list"></div>
+  </div>
+</div>
+
+<script>
+/* RIZ SUPABASE STORAGE DOCUMENT SYNC - FINAL */
+(function(){
+  const RIZ_SUPABASE_URL = "https://jtgiswzolnretpezfxpc.supabase.co";
+  const RIZ_SUPABASE_KEY = "sb_publishable_9m30QqCS2ttu9td6F84ogQ_JizwPY3v";
+  const BUCKET_NAME = "documents";
+
+  let rizDb = null;
+
+  function getDb(){
+    if (rizDb) return rizDb;
+    if (window.supabase && window.supabase.createClient) {
+      rizDb = window.supabase.createClient(RIZ_SUPABASE_URL, RIZ_SUPABASE_KEY);
+      return rizDb;
+    }
+    if (window.db && window.db.from) {
+      rizDb = window.db;
+      return rizDb;
+    }
+    throw new Error("Supabase client not loaded. Make sure internet is on and open with localhost/GitHub Pages.");
+  }
+
+  function setDocStatus(msg, isError=false){
+    const el = document.getElementById("riz-doc-status");
+    if (el) {
+      el.textContent = msg;
+      el.style.color = isError ? "#ef4444" : "#64748b";
+    }
+    console[isError ? "error" : "log"](msg);
+  }
+
+  function safeFileName(name){
+    return String(name || "file")
+      .replace(/[^\w.\-() ]+/g, "_")
+      .replace(/\s+/g, "_")
+      .slice(0, 120);
+  }
+
+  window.toggleRizDocPanel = function(){
+    const panel = document.getElementById("riz-doc-panel");
+    if (!panel) return;
+    panel.classList.toggle("open");
+    if (panel.classList.contains("open")) loadRizDocuments();
+  };
+
+  async function saveDocumentRecord(record){
+    const db = getDb();
+
+    // Try common table: documents
+    let res = await db.from("documents").insert(record).select().single();
+
+    if (!res.error) return res.data;
+
+    // If table schema uses different file_url / name still included by SQL we give.
+    throw res.error;
+  }
+
+  window.uploadRizDocuments = async function(){
+    try{
+      const db = getDb();
+      const input = document.getElementById("riz-doc-file");
+      const brand = document.getElementById("riz-doc-brand")?.value || "All Brands";
+      const files = Array.from(input?.files || []);
+
+      if (!files.length) {
+        alert("Choose file first.");
+        return;
+      }
+
+      setDocStatus("Uploading " + files.length + " file(s)...");
+
+      let success = 0;
+
+      for (const file of files){
+        const cleanName = safeFileName(file.name);
+        const path = brand.replace(/[^\w\-]+/g, "_") + "/" + Date.now() + "-" + Math.random().toString(36).slice(2,8) + "-" + cleanName;
+
+        const upload = await db.storage
+          .from(BUCKET_NAME)
+          .upload(path, file, { cacheControl: "3600", upsert: false });
+
+        if (upload.error) {
+          throw new Error("Storage upload failed: " + upload.error.message + ". Make sure bucket 'documents' exists and is public.");
+        }
+
+        const publicData = db.storage.from(BUCKET_NAME).getPublicUrl(path);
+        const publicUrl = publicData?.data?.publicUrl || "";
+
+        const record = {
+          brand: brand,
+          name: file.name,
+          file_name: file.name,
+          file_url: publicUrl,
+          url: publicUrl,
+          storage_path: path,
+          file_type: file.type || "",
+          size: file.size || 0,
+          created_at: new Date().toISOString()
+        };
+
+        await saveDocumentRecord(record);
+        success++;
+      }
+
+      input.value = "";
+      setDocStatus("Uploaded " + success + " file(s) to cloud.");
+      await loadRizDocuments();
+
+    }catch(err){
+      console.error(err);
+      setDocStatus(err.message || String(err), true);
+      alert("Upload failed: " + (err.message || String(err)));
+    }
+  };
+
+  window.loadRizDocuments = async function(){
+    const list = document.getElementById("riz-doc-list");
+    if (!list) return;
+
+    try{
+      const db = getDb();
+      setDocStatus("Loading cloud documents...");
+
+      const { data, error } = await db
+        .from("documents")
+        .select("*")
+        .order("created_at", { ascending:false });
+
+      if (error) throw error;
+
+      const docs = data || [];
+      if (!docs.length){
+        list.innerHTML = '<div class="riz-doc-card"><b>No cloud document yet.</b><small>Upload first file from phone/PC.</small></div>';
+        setDocStatus("No documents yet.");
+        return;
+      }
+
+      list.innerHTML = docs.map(doc => {
+        const name = doc.name || doc.file_name || "Document";
+        const url = doc.file_url || doc.url || "#";
+        const brand = doc.brand || "All Brands";
+        const date = doc.created_at ? new Date(doc.created_at).toLocaleString() : "";
+        const id = doc.id || "";
+        const storagePath = doc.storage_path || "";
+        return `
+          <div class="riz-doc-card">
+            <b>${name}</b>
+            <small>${brand} • ${date}</small>
+            <div class="riz-doc-actions">
+              <a href="${url}" target="_blank" rel="noopener">OPEN</a>
+              <a href="${url}" download>DOWNLOAD</a>
+              ${id ? `<button onclick="deleteRizDocument('${id}','${storagePath.replace(/'/g, "\\'")}')">DELETE</button>` : ""}
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      setDocStatus("Loaded " + docs.length + " cloud document(s).");
+
+    }catch(err){
+      console.error(err);
+      list.innerHTML = '<div class="riz-doc-card"><b>Cannot load documents.</b><small>' + (err.message || String(err)) + '</small></div>';
+      setDocStatus("Load failed: " + (err.message || String(err)), true);
+    }
+  };
+
+  window.deleteRizDocument = async function(id, storagePath){
+    if (!confirm("Delete this cloud document?")) return;
+
+    try{
+      const db = getDb();
+
+      if (storagePath) {
+        await db.storage.from(BUCKET_NAME).remove([storagePath]);
+      }
+
+      const { error } = await db.from("documents").delete().eq("id", id);
+      if (error) throw error;
+
+      setDocStatus("Document deleted.");
+      await loadRizDocuments();
+
+    }catch(err){
+      console.error(err);
+      setDocStatus("Delete failed: " + (err.message || String(err)), true);
+      alert("Delete failed: " + (err.message || String(err)));
+    }
+  };
+
+  document.addEventListener("DOMContentLoaded", function(){
+    setTimeout(function(){
+      try { getDb(); loadRizDocuments(); }
+      catch(e){ setDocStatus(e.message, true); }
+    }, 800);
+  });
+})();
+</script>
+
 </body>
 </html>
