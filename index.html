@@ -456,163 +456,114 @@ function taskForm(p){return`<div class="formGrid"><input id="${p}title" placehol
 function addTask(p){let brand=activeBrand==="all"?"all":activeBrand;let o={id:Date.now(),brand,title:val(p+"title"),due:val(p+"due"),priority:val(p+"priority"),done:false};if(!o.title)return alert("Fill task title.");data.tasks.unshift(o);save();closeModal();render()}
 function renderTasks(){document.getElementById("tasks").innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Task</h3></div><div class="panelBody">${taskForm("t")}</div></div><div class="panel"><div class="panelHead"><h3>Tasks</h3></div><div class="panelBody">${rows("tasks").map(taskCard).join("")||empty("No tasks")}</div></div>`} function taskCard(x){return`<div class="taskCard"><div><div class="fileName" style="${x.done?'text-decoration:line-through;color:#999':''}">${esc(x.title)}</div><div class="meta">${brandNames[x.brand]} • Due: ${x.due||"-"} • ${badge(x.priority)} ${x.done?badge("Done"):""}</div></div><div class="actions"><button class="iconBtn" data-toggle-task="${x.id}">${x.done?"Undo":"Done"}</button><button class="btn danger" data-del="tasks:${x.id}">Delete</button></div></div>`}
 
-function docForm(p){return`<div class="formGrid"><input id="${p}date" type="date" value="${today()}"><input id="${p}name" placeholder="Document title"><input id="${p}type" placeholder="Type"><select id="${p}status"><option>Active</option><option>Draft</option><option>Pending</option></select><input id="${p}note" placeholder="Note / link"><input id="${p}file" type="file" multiple><button class="btn primary" data-add-doc="${p}">Add Document</button></div>`}
 
 /* ===== RIZ SAFE DOCUMENT CLOUD SYNC PATCH ===== */
-const RIZ_DOC_BUCKET_SAFE = "documents";
+const RIZ_DOC_BUCKET_SAFE="documents";
 
 function cleanRizDocName(name){
-  return String(name || "file").replace(/[^\w.\-() ]+/g,"_").replace(/\s+/g,"_").slice(0,120);
+  return String(name||"file").replace(/[^\w.\-() ]+/g,"_").replace(/\s+/g,"_").slice(0,120);
 }
 
-async function rizUploadDocFileSafe(file, brand){
+async function rizEnsureCloudReady(){
   if(!rizSB) throw new Error("Supabase not connected");
-  const folder = String(brand || "all").replace(/[^\w\-]+/g,"_");
-  const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2,8)}-${cleanRizDocName(file.name)}`;
-
-  const up = await rizSB.storage
-    .from(RIZ_DOC_BUCKET_SAFE)
-    .upload(path, file, { cacheControl:"3600", upsert:false });
-
-  if(up.error) throw new Error("Storage upload failed: " + up.error.message);
-
-  const pub = rizSB.storage.from(RIZ_DOC_BUCKET_SAFE).getPublicUrl(path);
-
-  return {
-    key: path,
-    storage_path: path,
-    url: pub?.data?.publicUrl || "",
-    name: file.name,
-    type: file.type || "file",
-    size: file.size || 0,
-    cloud: true
-  };
+  return rizSB;
 }
 
-async function rizPrepareCloudFilesSafe(fileList, brand){
-  const files = Array.from(fileList || []);
-  const out = [];
-  for(const f of files){
-    out.push(await rizUploadDocFileSafe(f, brand));
-  }
+async function rizUploadDocFileSafe(file,brand){
+  const sb=await rizEnsureCloudReady();
+  const folder=String(brand||"all").replace(/[^\w\-]+/g,"_");
+  const path=`${folder}/${Date.now()}-${Math.random().toString(36).slice(2,8)}-${cleanRizDocName(file.name)}`;
+  const up=await sb.storage.from(RIZ_DOC_BUCKET_SAFE).upload(path,file,{cacheControl:"3600",upsert:false});
+  if(up.error)throw new Error("Storage upload failed: "+up.error.message);
+  const pub=sb.storage.from(RIZ_DOC_BUCKET_SAFE).getPublicUrl(path);
+  return {key:path,storage_path:path,url:pub?.data?.publicUrl||"",name:file.name,type:file.type||"file",size:file.size||0,cloud:true};
+}
+
+async function rizPrepareCloudFilesSafe(fileList,brand){
+  const out=[];
+  for(const f of Array.from(fileList||[])) out.push(await rizUploadDocFileSafe(f,brand));
   return out;
 }
 
-async function rizSaveDocumentCloudSafe(doc){
-  if(!rizSB || !doc) return;
-
-  const payload = {
-    local_id: String(doc.id || Date.now()),
-    date: doc.date || today(),
-    brand: doc.brand || "all",
-    name: doc.name || "Document",
-    type: doc.type || "",
-    status: doc.status || "Active",
-    note: doc.note || "",
-    files: doc.files || [],
-    file_url: (doc.files || [])[0]?.url || "",
-    file_name: (doc.files || [])[0]?.name || "",
-    storage_path: (doc.files || [])[0]?.storage_path || (doc.files || [])[0]?.key || "",
-    created_at: new Date().toISOString()
-  };
-
-  const { error } = await rizSB.from("documents").insert(payload);
-  if(error) throw error;
+function rizMapCloudDocumentSafe(d){
+  let files=[];
+  if(Array.isArray(d.files))files=d.files;
+  else if(typeof d.files==="string"){try{files=JSON.parse(d.files)||[]}catch(e){files=[]}}
+  if(!files.length&&(d.file_url||d.url)){
+    files=[{key:d.storage_path||d.file_url||d.url,storage_path:d.storage_path||"",url:d.file_url||d.url,name:d.file_name||d.name||"Document",type:d.file_type||"file",size:d.size||0,cloud:true}];
+  }
+  return {id:"DBDOC-"+d.id,date:d.date||String(d.created_at||"").slice(0,10)||today(),brand:d.brand||"all",name:d.name||d.file_name||"Document",type:d.type||d.file_type||"",status:d.status||"Active",note:d.note||"",files,cloud:true};
 }
 
-function rizMapCloudDocumentSafe(d){
-  let files = [];
-  if(Array.isArray(d.files)) files = d.files;
-  else if(typeof d.files === "string"){
-    try{ files = JSON.parse(d.files) || []; }catch(e){ files = []; }
-  }
-
-  if(!files.length && (d.file_url || d.url)){
-    files = [{
-      key: d.storage_path || d.file_url || d.url,
-      storage_path: d.storage_path || "",
-      url: d.file_url || d.url,
-      name: d.file_name || d.name || "Document",
-      type: d.file_type || "file",
-      size: d.size || 0,
-      cloud: true
-    }];
-  }
-
-  return {
-    id: "DBDOC-" + d.id,
-    date: d.date || String(d.created_at || "").slice(0,10) || today(),
-    brand: d.brand || "all",
-    name: d.name || d.file_name || "Document",
-    type: d.type || d.file_type || "",
-    status: d.status || "Active",
-    note: d.note || "",
-    files,
-    cloud: true
-  };
+async function rizSaveDocumentCloudSafe(doc){
+  const sb=await rizEnsureCloudReady();
+  const payload={local_id:String(doc.id||Date.now()),date:doc.date||today(),brand:doc.brand||"all",name:doc.name||"Document",type:doc.type||"",status:doc.status||"Active",note:doc.note||"",files:doc.files||[],file_url:(doc.files||[])[0]?.url||"",file_name:(doc.files||[])[0]?.name||"",storage_path:(doc.files||[])[0]?.storage_path||(doc.files||[])[0]?.key||"",file_type:(doc.files||[])[0]?.type||"",size:(doc.files||[])[0]?.size||0,created_at:new Date().toISOString()};
+  const res=await sb.from("documents").insert(payload).select().single();
+  if(res.error)throw res.error;
+  return res.data;
 }
 
 async function rizLoadCloudDocumentsSafe(){
-  if(!rizSB) return;
+  if(!rizSB)return;
   try{
-    const { data: docs, error } = await rizSB
-      .from("documents")
-      .select("*")
-      .order("created_at", { ascending:false });
-
-    if(error) throw error;
-
-    const cloudDocs = (docs || []).map(rizMapCloudDocumentSafe);
-    const nonCloud = (data.documents || []).filter(d => !String(d.id).startsWith("DBDOC-") && !d.cloud);
-    data.documents = [...cloudDocs, ...nonCloud];
-
-    try{ localStorage.setItem(KEY, JSON.stringify(data)); }catch(e){}
-    render();
+    const {data:docs,error}=await rizSB.from("documents").select("*").order("created_at",{ascending:false});
+    if(error)throw error;
+    const cloudDocs=(docs||[]).map(rizMapCloudDocumentSafe);
+    const localOnly=(data.documents||[]).filter(d=>!String(d.id).startsWith("DBDOC-")&&!d.cloud);
+    data.documents=[...cloudDocs,...localOnly];
+    try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){}
   }catch(err){
-    console.warn("Cloud document load failed:", err);
-    if(typeof rizSetStatus === "function") rizSetStatus("Document sync blocked - check SQL/storage", false);
+    console.warn("Cloud document load failed:",err);
+    if(typeof rizSetStatus==="function")rizSetStatus("Documents sync blocked - check SQL/storage",false);
   }
 }
 /* ===== END RIZ SAFE DOCUMENT CLOUD SYNC PATCH ===== */
 
+
+function docForm(p){return`<div class="formGrid"><input id="${p}date" type="date" value="${today()}"><input id="${p}name" placeholder="Document title"><input id="${p}type" placeholder="Type"><select id="${p}status"><option>Active</option><option>Draft</option><option>Pending</option></select><input id="${p}note" placeholder="Note / link"><input id="${p}file" type="file" multiple><button class="btn primary" data-add-doc="${p}">Add Document</button></div>`}
 async function addDoc(p){
-  let brand = activeBrand === "all" ? "all" : activeBrand;
-  let o = {
-    id: Date.now(),
-    date: val(p+"date") || today(),
-    brand,
-    name: val(p+"name"),
-    type: val(p+"type"),
-    status: val(p+"status"),
-    note: val(p+"note"),
-    files: [],
-    cloud: true
-  };
-
-  if(!o.name) return alert("Fill document title.");
-
+  let brand=activeBrand==="all"?"all":activeBrand;
+  let o={id:Date.now(),date:val(p+"date")||today(),brand,name:val(p+"name"),type:val(p+"type"),status:val(p+"status"),note:val(p+"note"),files:[],cloud:true};
+  if(!o.name)return alert("Fill document title.");
   try{
-    const input = document.getElementById(p+"file");
-    if(input && input.files && input.files.length){
-      o.files = await rizPrepareCloudFilesSafe(input.files, brand);
-    }
-
-    await rizSaveDocumentCloudSafe(o);
+    const input=document.getElementById(p+"file");
+    if(input&&input.files&&input.files.length)o.files=await rizPrepareCloudFilesSafe(input.files,brand);
+    const saved=await rizSaveDocumentCloudSafe(o);
+    o=rizMapCloudDocumentSafe(saved);
     data.documents.unshift(o);
     save();
     closeModal();
+    await rizLoadCloudDocumentsSafe();
     render();
-
-    setTimeout(()=>rizLoadCloudDocumentsSafe(), 500);
-    alert("Document uploaded and synced to Supabase.");
+    alert("Document uploaded and synced.");
   }catch(e){
     console.error(e);
-    alert("Upload failed: " + (e.message || "Check Supabase bucket/policy."));
+    alert("Upload failed: "+(e.message||"Check Supabase Storage / SQL policy."));
   }
 }
-function renderDocuments(){document.getElementById("documents").innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Document</h3></div><div class="panelBody">${docForm("d")}</div></div><div class="panel"><div class="panelHead"><h3>Documents</h3><button class="btn ghost" data-export="documents">Export CSV</button></div><div class="panelBody">${docTable(rows("documents"))}</div></div>`}
+async function renderDocuments(){
+  const el=document.getElementById("documents");
+  if(!el)return;
+  el.innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Document</h3></div><div class="panelBody">${docForm("d")}</div></div><div class="panel"><div class="panelHead"><h3>Documents</h3><button class="btn ghost" data-export="documents">Export CSV</button></div><div class="panelBody">${empty("Loading documents...")}</div></div>`;
+  await rizLoadCloudDocumentsSafe();
+  el.innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Document</h3></div><div class="panelBody">${docForm("d")}</div></div><div class="panel"><div class="panelHead"><h3>Documents</h3><button class="btn ghost" data-export="documents">Export CSV</button></div><div class="panelBody">${docTable(rows("documents"))}</div></div>`;
+}
 function docTable(r){if(!r.length)return empty("No documents");return r.map(x=>`<div class="fileCard"><div style="display:flex;gap:12px"><img class="miniLogo" src="${logos[x.brand||"all"]}"><div><div class="fileName">${esc(x.name)}</div><div class="meta">${x.date} • ${brandNames[x.brand]} • ${esc(x.type||"-")} • ${badge(x.status)}</div><div class="meta">${esc(x.note||"")}</div><div class="meta">${x.files?.length?`<b>${x.files.length} file(s):</b> ${x.files.map(f=>esc(f.name)+" "+size(f.size)).join(", ")}`:"No file uploaded"}</div><div class="actions" style="margin-top:9px">${(x.files||[]).map((f,i)=>`<button class="iconBtn" data-view-file="${x.id}:${i}">View ${i+1}</button><button class="iconBtn" data-download-file="${x.id}:${i}">Download</button><button class="btn danger" data-remove-file="${x.id}:${i}">Remove</button>`).join("")}</div></div></div><div class="actions"><label class="iconBtn">Upload More<input type="file" hidden multiple data-upload-more="${x.id}"></label><button class="iconBtn" data-edit="documents:${x.id}">Edit</button><button class="btn danger" data-del="documents:${x.id}">Delete</button></div></div>`).join("")}
-async function uploadMore(e,id){let doc=data.documents.find(d=>String(d.id)===String(id));if(!doc)return;try{doc.files.push(...await prepareFiles(e.target.files));save();render()}catch(err){alert("Upload failed")}} async function viewFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;let blob=await getFile(f.key);if(!blob)return alert("File not found in browser.");let url=URL.createObjectURL(blob),w=window.open("");if((f.type||"").startsWith("image/"))w.document.write(`<img src="${url}" style="max-width:100%;max-height:100vh;display:block;margin:auto">`);else if((f.type||"").includes("pdf"))w.document.write(`<iframe src="${url}" style="border:0;width:100%;height:100vh"></iframe>`);else w.document.write(`<a href="${url}" download="${esc(f.name)}">Download ${esc(f.name)}</a>`)} async function downloadFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;let blob=await getFile(f.key);let url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)} async function removeFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id));if(!d?.files?.[i])return;if(confirm("Remove file?")){await delFile(d.files[i].key);d.files.splice(i,1);save();render()}}
+async function uploadMore(e,id){let doc=data.documents.find(d=>String(d.id)===String(id));if(!doc)return;try{doc.files.push(...await prepareFiles(e.target.files));save();render()}catch(err){alert("Upload failed")}} async function viewFile(id,i){
+  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;
+  if(f.url){window.open(f.url,"_blank");return;}
+  let blob=await getFile(f.key);if(!blob)return alert("File not found in browser.");
+  let url=URL.createObjectURL(blob),w=window.open("");
+  if((f.type||"").startsWith("image/"))w.document.write(`<img src="${url}" style="max-width:100%;max-height:100vh;display:block;margin:auto">`);
+  else if((f.type||"").includes("pdf"))w.document.write(`<iframe src="${url}" style="border:0;width:100%;height:100vh"></iframe>`);
+  else w.document.write(`<a href="${url}" download="${esc(f.name)}">Download ${esc(f.name)}</a>`);
+}
+async function downloadFile(id,i){
+  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;
+  if(f.url){let a=document.createElement("a");a.href=f.url;a.download=f.name||"document";a.target="_blank";a.click();return;}
+  let blob=await getFile(f.key),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+async function removeFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id));if(!d?.files?.[i])return;if(confirm("Remove file?")){await delFile(d.files[i].key);d.files.splice(i,1);save();render()}}
 
 function teamForm(p){return`<div class="formGrid"><input id="${p}name" placeholder="Name"><input id="${p}role" placeholder="Role"><input id="${p}responsible" placeholder="Responsible / details"><button class="btn primary" data-add-team="${p}">Add Member</button></div>`}
 function addTeam(p){let brand=activeBrand==="all"?"all":activeBrand;let o={id:Date.now(),brand,name:val(p+"name"),role:val(p+"role"),responsible:val(p+"responsible")};if(!o.name)return alert("Fill name.");data.team.unshift(o);save();closeModal();render()}
@@ -799,6 +750,7 @@ document.addEventListener("input",e=>{if(e.target.id==="search")render();});
 
 
 initRizSupabase();
+setTimeout(()=>rizLoadCloudDocumentsSafe().then(()=>render()),1500);
 </script>
 </body>
 </html>
