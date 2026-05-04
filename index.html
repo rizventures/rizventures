@@ -363,58 +363,11 @@ function rebuildWorkspaceSidebar(){
 function save(){cleanupInventoryData();localStorage.setItem(KEY,JSON.stringify(data)); rizQueueSync()} function money(n){return"RM"+Number(n||0).toFixed(2)} function today(){return new Date().toISOString().slice(0,10)} function val(id){return(document.getElementById(id)?.value||"").trim()} function search(){return val("search").toLowerCase()} function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]))} function match(x){return!search()||JSON.stringify(x).toLowerCase().includes(search())} function byBrand(a){return (a||[]).filter(x=>activeBrand==="all"||x.brand===activeBrand)} function rows(t){return byBrand(data[t]||[]).filter(match)} function opts(all=false){syncWorkspaceMaps();return `${all?'<option value="all">All Brands</option>':''}${workspaceList.filter(w=>w.id!=="all").map(w=>`<option value="${esc(w.id)}">${esc(w.name)}</option>`).join("")}`} function badge(s){let k=String(s).toLowerCase(),c=k==="paid"||k==="active"||k==="done"?"paid":k==="pending"||k==="medium"?"pending":k==="draft"?"draft":"cancelled";return`<span class="badge ${c}">${s}</span>`} function empty(t){return`<div class="empty">${t}</div>`}
 
 const DB="riz_command_files", STORE="files";
-const RIZ_DOC_BUCKET="documents";
-
 function openDB(){return new Promise((res,rej)=>{let r=indexedDB.open(DB,1);r.onupgradeneeded=()=>r.result.createObjectStore(STORE);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
 async function putFile(k,b){let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readwrite");tx.objectStore(STORE).put(b,k);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
-
-function cleanStorageName(name){
-  return String(name||"file").replace(/[^\w.\-() ]+/g,"_").replace(/\s+/g,"_").slice(0,120);
-}
-function docBrandName(brand){
-  return brandNames[brand] || brand || "All Brands";
-}
-async function uploadFileToSupabase(file, brand){
-  if(!rizSB) throw new Error("Supabase not connected.");
-  const folder = String(brand||"all").replace(/[^\w\-]+/g,"_");
-  const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2,8)}-${cleanStorageName(file.name)}`;
-  const up = await rizSB.storage.from(RIZ_DOC_BUCKET).upload(path, file, {cacheControl:"3600", upsert:false});
-  if(up.error) throw new Error("Storage upload failed: "+up.error.message);
-  const pub = rizSB.storage.from(RIZ_DOC_BUCKET).getPublicUrl(path);
-  return {
-    key:path,
-    storage_path:path,
-    url:pub?.data?.publicUrl || "",
-    name:file.name,
-    type:file.type||"file",
-    size:file.size||0,
-    cloud:true
-  };
-}
-async function getFile(k){
-  if(String(k||"").startsWith("http")) return null;
-  let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readonly"),r=tx.objectStore(STORE).get(k);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})
-}
-async function delFile(k){
-  if(rizSB && k && !String(k).startsWith("f_")){
-    try{ await rizSB.storage.from(RIZ_DOC_BUCKET).remove([k]); }catch(e){ console.warn(e); }
-    return;
-  }
-  let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readwrite");tx.objectStore(STORE).delete(k);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})
-}
-async function prepareFiles(list, brand){
-  let out=[];
-  for(const f of Array.from(list||[])){
-    if(rizSB){
-      out.push(await uploadFileToSupabase(f, brand || activeBrand || "all"));
-    }else{
-      let key="f_"+Date.now()+"_"+Math.random().toString(36).slice(2);
-      await putFile(key,f);
-      out.push({key,name:f.name,type:f.type||"file",size:f.size||0,cloud:false});
-    }
-  }
-  return out;
-}
+async function getFile(k){let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readonly"),r=tx.objectStore(STORE).get(k);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
+async function delFile(k){let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readwrite");tx.objectStore(STORE).delete(k);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
+async function prepareFiles(list){let out=[];for(const f of Array.from(list||[])){let key="f_"+Date.now()+"_"+Math.random().toString(36).slice(2);await putFile(key,f);out.push({key,name:f.name,type:f.type||"file",size:f.size||0})}return out}
 function size(s){if(!s)return"";if(s<1024)return s+" B";if(s<1048576)return(s/1024).toFixed(1)+" KB";return(s/1048576).toFixed(1)+" MB"}
 
 function statData(){let s=rows("sales"),e=rows("expenses"),p=rows("products");let rev=s.filter(x=>x.status==="Paid").reduce((a,b)=>a+Number(b.amount||0),0), exp=e.filter(x=>x.status==="Paid").reduce((a,b)=>a+Number(b.amount||0),0), stock=p.reduce((a,b)=>a+Number(b.stock||0)*Number(b.cost||0),0); return {rev,exp,net:rev-exp,stock,count:s.length}}
@@ -504,135 +457,162 @@ function addTask(p){let brand=activeBrand==="all"?"all":activeBrand;let o={id:Da
 function renderTasks(){document.getElementById("tasks").innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Task</h3></div><div class="panelBody">${taskForm("t")}</div></div><div class="panel"><div class="panelHead"><h3>Tasks</h3></div><div class="panelBody">${rows("tasks").map(taskCard).join("")||empty("No tasks")}</div></div>`} function taskCard(x){return`<div class="taskCard"><div><div class="fileName" style="${x.done?'text-decoration:line-through;color:#999':''}">${esc(x.title)}</div><div class="meta">${brandNames[x.brand]} • Due: ${x.due||"-"} • ${badge(x.priority)} ${x.done?badge("Done"):""}</div></div><div class="actions"><button class="iconBtn" data-toggle-task="${x.id}">${x.done?"Undo":"Done"}</button><button class="btn danger" data-del="tasks:${x.id}">Delete</button></div></div>`}
 
 function docForm(p){return`<div class="formGrid"><input id="${p}date" type="date" value="${today()}"><input id="${p}name" placeholder="Document title"><input id="${p}type" placeholder="Type"><select id="${p}status"><option>Active</option><option>Draft</option><option>Pending</option></select><input id="${p}note" placeholder="Note / link"><input id="${p}file" type="file" multiple><button class="btn primary" data-add-doc="${p}">Add Document</button></div>`}
-async function addDoc(p){
-  let brand=activeBrand==="all"?"all":activeBrand;
-  let o={id:Date.now(),date:val(p+"date")||today(),brand,name:val(p+"name"),type:val(p+"type"),status:val(p+"status"),note:val(p+"note"),files:[],cloud:true};
-  if(!o.name)return alert("Fill document title.");
-  try{
-    o.files=await prepareFiles(document.getElementById(p+"file").files, brand);
-    data.documents.unshift(o);
-    save();
-    await saveDocumentToSupabase(o);
-    closeModal();
-    await loadCloudDocuments(false);
-    render();
-  }catch(e){
-    console.error(e);
-    alert("Upload failed: "+(e.message||"Check Supabase Storage bucket/policy."));
-  }
+
+/* ===== RIZ SAFE DOCUMENT CLOUD SYNC PATCH ===== */
+const RIZ_DOC_BUCKET_SAFE = "documents";
+
+function cleanRizDocName(name){
+  return String(name || "file").replace(/[^\w.\-() ]+/g,"_").replace(/\s+/g,"_").slice(0,120);
 }
 
-async function saveDocumentToSupabase(doc){
-  if(!rizSB || !doc) return;
-  const payload={
-    local_id:String(doc.id||Date.now()),
-    date:doc.date||today(),
-    brand:doc.brand||"all",
-    name:doc.name||"Document",
-    type:doc.type||"",
-    status:doc.status||"Active",
-    note:doc.note||"",
-    files:doc.files||[],
-    file_url:(doc.files||[])[0]?.url || "",
-    file_name:(doc.files||[])[0]?.name || "",
-    storage_path:(doc.files||[])[0]?.storage_path || (doc.files||[])[0]?.key || "",
-    created_at:new Date().toISOString()
-  };
+async function rizUploadDocFileSafe(file, brand){
+  if(!rizSB) throw new Error("Supabase not connected");
+  const folder = String(brand || "all").replace(/[^\w\-]+/g,"_");
+  const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2,8)}-${cleanRizDocName(file.name)}`;
 
-  if(String(doc.id||"").startsWith("DBDOC-")){
-    const dbid=String(doc.id).replace("DBDOC-","");
-    const {error}=await rizSB.from("documents").update(payload).eq("id",dbid);
-    if(error) throw error;
-    return;
-  }
+  const up = await rizSB.storage
+    .from(RIZ_DOC_BUCKET_SAFE)
+    .upload(path, file, { cacheControl:"3600", upsert:false });
 
-  const existing=await rizSB.from("documents").select("id").eq("local_id",payload.local_id).maybeSingle();
-  if(existing.error) throw existing.error;
+  if(up.error) throw new Error("Storage upload failed: " + up.error.message);
 
-  if(existing.data?.id){
-    const {error}=await rizSB.from("documents").update(payload).eq("id",existing.data.id);
-    if(error) throw error;
-  }else{
-    const {error}=await rizSB.from("documents").insert(payload);
-    if(error) throw error;
-  }
-}
+  const pub = rizSB.storage.from(RIZ_DOC_BUCKET_SAFE).getPublicUrl(path);
 
-function mapCloudDoc(d){
-  let files=[];
-  if(Array.isArray(d.files)) files=d.files;
-  else if(d.files && typeof d.files==="string"){
-    try{files=JSON.parse(d.files)}catch(e){files=[]}
-  }
-  if(!files.length && (d.file_url||d.url)){
-    files=[{name:d.file_name||d.name||"Document",url:d.file_url||d.url,key:d.storage_path||"",storage_path:d.storage_path||"",type:d.file_type||"file",size:d.size||0,cloud:true}];
-  }
   return {
-    id:"DBDOC-"+d.id,
-    date:d.date||String(d.created_at||"").slice(0,10)||today(),
-    brand:d.brand||"all",
-    name:d.name||d.file_name||"Document",
-    type:d.type||d.file_type||"",
-    status:d.status||"Active",
-    note:d.note||"",
-    files,
-    cloud:true
+    key: path,
+    storage_path: path,
+    url: pub?.data?.publicUrl || "",
+    name: file.name,
+    type: file.type || "file",
+    size: file.size || 0,
+    cloud: true
   };
 }
 
-async function loadCloudDocuments(doRender=true){
+async function rizPrepareCloudFilesSafe(fileList, brand){
+  const files = Array.from(fileList || []);
+  const out = [];
+  for(const f of files){
+    out.push(await rizUploadDocFileSafe(f, brand));
+  }
+  return out;
+}
+
+async function rizSaveDocumentCloudSafe(doc){
+  if(!rizSB || !doc) return;
+
+  const payload = {
+    local_id: String(doc.id || Date.now()),
+    date: doc.date || today(),
+    brand: doc.brand || "all",
+    name: doc.name || "Document",
+    type: doc.type || "",
+    status: doc.status || "Active",
+    note: doc.note || "",
+    files: doc.files || [],
+    file_url: (doc.files || [])[0]?.url || "",
+    file_name: (doc.files || [])[0]?.name || "",
+    storage_path: (doc.files || [])[0]?.storage_path || (doc.files || [])[0]?.key || "",
+    created_at: new Date().toISOString()
+  };
+
+  const { error } = await rizSB.from("documents").insert(payload);
+  if(error) throw error;
+}
+
+function rizMapCloudDocumentSafe(d){
+  let files = [];
+  if(Array.isArray(d.files)) files = d.files;
+  else if(typeof d.files === "string"){
+    try{ files = JSON.parse(d.files) || []; }catch(e){ files = []; }
+  }
+
+  if(!files.length && (d.file_url || d.url)){
+    files = [{
+      key: d.storage_path || d.file_url || d.url,
+      storage_path: d.storage_path || "",
+      url: d.file_url || d.url,
+      name: d.file_name || d.name || "Document",
+      type: d.file_type || "file",
+      size: d.size || 0,
+      cloud: true
+    }];
+  }
+
+  return {
+    id: "DBDOC-" + d.id,
+    date: d.date || String(d.created_at || "").slice(0,10) || today(),
+    brand: d.brand || "all",
+    name: d.name || d.file_name || "Document",
+    type: d.type || d.file_type || "",
+    status: d.status || "Active",
+    note: d.note || "",
+    files,
+    cloud: true
+  };
+}
+
+async function rizLoadCloudDocumentsSafe(){
   if(!rizSB) return;
   try{
-    const {data:docs,error}=await rizSB.from("documents").select("*").order("created_at",{ascending:false});
+    const { data: docs, error } = await rizSB
+      .from("documents")
+      .select("*")
+      .order("created_at", { ascending:false });
+
     if(error) throw error;
-    const cloud=(docs||[]).map(mapCloudDoc);
-    const local=(data.documents||[]).filter(x=>!String(x.id).startsWith("DBDOC-") && !x.cloud);
-    data.documents=[...cloud,...local];
-    localStorage.setItem(KEY,JSON.stringify(data));
-    if(doRender) render();
+
+    const cloudDocs = (docs || []).map(rizMapCloudDocumentSafe);
+    const nonCloud = (data.documents || []).filter(d => !String(d.id).startsWith("DBDOC-") && !d.cloud);
+    data.documents = [...cloudDocs, ...nonCloud];
+
+    try{ localStorage.setItem(KEY, JSON.stringify(data)); }catch(e){}
+    render();
   }catch(err){
-    console.warn("Cloud documents load failed",err);
-    rizSetStatus("Documents sync blocked - check SQL/storage", false);
+    console.warn("Cloud document load failed:", err);
+    if(typeof rizSetStatus === "function") rizSetStatus("Document sync blocked - check SQL/storage", false);
   }
 }
+/* ===== END RIZ SAFE DOCUMENT CLOUD SYNC PATCH ===== */
 
+async function addDoc(p){
+  let brand = activeBrand === "all" ? "all" : activeBrand;
+  let o = {
+    id: Date.now(),
+    date: val(p+"date") || today(),
+    brand,
+    name: val(p+"name"),
+    type: val(p+"type"),
+    status: val(p+"status"),
+    note: val(p+"note"),
+    files: [],
+    cloud: true
+  };
+
+  if(!o.name) return alert("Fill document title.");
+
+  try{
+    const input = document.getElementById(p+"file");
+    if(input && input.files && input.files.length){
+      o.files = await rizPrepareCloudFilesSafe(input.files, brand);
+    }
+
+    await rizSaveDocumentCloudSafe(o);
+    data.documents.unshift(o);
+    save();
+    closeModal();
+    render();
+
+    setTimeout(()=>rizLoadCloudDocumentsSafe(), 500);
+    alert("Document uploaded and synced to Supabase.");
+  }catch(e){
+    console.error(e);
+    alert("Upload failed: " + (e.message || "Check Supabase bucket/policy."));
+  }
+}
 function renderDocuments(){document.getElementById("documents").innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Document</h3></div><div class="panelBody">${docForm("d")}</div></div><div class="panel"><div class="panelHead"><h3>Documents</h3><button class="btn ghost" data-export="documents">Export CSV</button></div><div class="panelBody">${docTable(rows("documents"))}</div></div>`}
 function docTable(r){if(!r.length)return empty("No documents");return r.map(x=>`<div class="fileCard"><div style="display:flex;gap:12px"><img class="miniLogo" src="${logos[x.brand||"all"]}"><div><div class="fileName">${esc(x.name)}</div><div class="meta">${x.date} • ${brandNames[x.brand]} • ${esc(x.type||"-")} • ${badge(x.status)}</div><div class="meta">${esc(x.note||"")}</div><div class="meta">${x.files?.length?`<b>${x.files.length} file(s):</b> ${x.files.map(f=>esc(f.name)+" "+size(f.size)).join(", ")}`:"No file uploaded"}</div><div class="actions" style="margin-top:9px">${(x.files||[]).map((f,i)=>`<button class="iconBtn" data-view-file="${x.id}:${i}">View ${i+1}</button><button class="iconBtn" data-download-file="${x.id}:${i}">Download</button><button class="btn danger" data-remove-file="${x.id}:${i}">Remove</button>`).join("")}</div></div></div><div class="actions"><label class="iconBtn">Upload More<input type="file" hidden multiple data-upload-more="${x.id}"></label><button class="iconBtn" data-edit="documents:${x.id}">Edit</button><button class="btn danger" data-del="documents:${x.id}">Delete</button></div></div>`).join("")}
-async function uploadMore(e,id){
-  let doc=data.documents.find(d=>String(d.id)===String(id));if(!doc)return;
-  try{
-    const newFiles=await prepareFiles(e.target.files, doc.brand || activeBrand || "all");
-    doc.files.push(...newFiles);
-    save();
-    await saveDocumentToSupabase(doc);
-    await loadCloudDocuments(false);
-    render();
-  }catch(err){console.error(err);alert("Upload failed: "+(err.message||"Check Supabase Storage."))}
-}
-async function viewFile(id,i){
-  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;
-  if(f.url){ window.open(f.url,"_blank"); return; }
-  let blob=await getFile(f.key);if(!blob)return alert("File not found in browser.");
-  let url=URL.createObjectURL(blob),w=window.open("");
-  if((f.type||"").startsWith("image/"))w.document.write(`<img src="${url}" style="max-width:100%;max-height:100vh;display:block;margin:auto">`);
-  else if((f.type||"").includes("pdf"))w.document.write(`<iframe src="${url}" style="border:0;width:100%;height:100vh"></iframe>`);
-  else w.document.write(`<a href="${url}" download="${esc(f.name)}">Download ${esc(f.name)}</a>`);
-}
-async function downloadFile(id,i){
-  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;
-  if(f.url){ let a=document.createElement("a");a.href=f.url;a.download=f.name||"document";a.target="_blank";a.click(); return; }
-  let blob=await getFile(f.key);let url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)
-}
-async function removeFile(id,i){
-  let d=data.documents.find(x=>String(x.id)===String(id));if(!d?.files?.[i])return;
-  if(confirm("Remove file?")){
-    await delFile(d.files[i].storage_path||d.files[i].key);
-    d.files.splice(i,1);
-    save();
-    await saveDocumentToSupabase(d);
-    render();
-  }
-}}
+async function uploadMore(e,id){let doc=data.documents.find(d=>String(d.id)===String(id));if(!doc)return;try{doc.files.push(...await prepareFiles(e.target.files));save();render()}catch(err){alert("Upload failed")}} async function viewFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;let blob=await getFile(f.key);if(!blob)return alert("File not found in browser.");let url=URL.createObjectURL(blob),w=window.open("");if((f.type||"").startsWith("image/"))w.document.write(`<img src="${url}" style="max-width:100%;max-height:100vh;display:block;margin:auto">`);else if((f.type||"").includes("pdf"))w.document.write(`<iframe src="${url}" style="border:0;width:100%;height:100vh"></iframe>`);else w.document.write(`<a href="${url}" download="${esc(f.name)}">Download ${esc(f.name)}</a>`)} async function downloadFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;let blob=await getFile(f.key);let url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)} async function removeFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id));if(!d?.files?.[i])return;if(confirm("Remove file?")){await delFile(d.files[i].key);d.files.splice(i,1);save();render()}}
 
 function teamForm(p){return`<div class="formGrid"><input id="${p}name" placeholder="Name"><input id="${p}role" placeholder="Role"><input id="${p}responsible" placeholder="Responsible / details"><button class="btn primary" data-add-team="${p}">Add Member</button></div>`}
 function addTeam(p){let brand=activeBrand==="all"?"all":activeBrand;let o={id:Date.now(),brand,name:val(p+"name"),role:val(p+"role"),responsible:val(p+"responsible")};if(!o.name)return alert("Fill name.");data.team.unshift(o);save();closeModal();render()}
@@ -779,22 +759,7 @@ async function saveEdit(t,id){
   closeModal();render();return;
  }
  Object.keys(x).filter(k=>k!=="id"&&k!=="files").forEach(k=>{let vv=val("edit_"+k);x[k]=(!isNaN(vv)&&vv!=="")?Number(vv):vv});save();closeModal();render()
-} async function del(t,id){
-  if(!confirm("Delete this record?"))return;
-  if(t==="documents"){
-    const doc=data.documents.find(x=>String(x.id)===String(id));
-    if(doc && String(doc.id).startsWith("DBDOC-") && rizSB){
-      const dbid=String(doc.id).replace("DBDOC-","");
-      try{
-        for(const f of (doc.files||[])){ if(f.storage_path||f.key) await delFile(f.storage_path||f.key); }
-        await rizSB.from("documents").delete().eq("id",dbid);
-      }catch(e){console.warn(e); alert("Cloud delete failed: "+(e.message||e)); return;}
-    }
-  }
-  data[t]=data[t].filter(x=>String(x.id)!==String(id));
-  save();
-  render();
-}} function toggleTask(id){let t=data.tasks.find(x=>String(x.id)===String(id));if(t){t.done=!t.done;save();render()}}
+} function del(t,id){if(confirm("Delete this record?")){data[t]=data[t].filter(x=>String(x.id)!==String(id));save();render()}} function toggleTask(id){let t=data.tasks.find(x=>String(x.id)===String(id));if(t){t.done=!t.done;save();render()}}
 
 function openQuick(){document.getElementById("modalTitle").textContent="Quick Add";document.getElementById("modalBody").innerHTML=`<div class="cards"><button class="btn primary" data-open="sale">Add Sale</button><button class="btn primary" data-open="product">Add Product</button><button class="btn primary" data-open="expense">Add Expense</button><button class="btn primary" data-open="customer">Add Customer</button><button class="btn primary" data-open="task">Add Task</button><button class="btn primary" data-open="doc">Add Document</button><button class="btn primary" data-open="team">Add Team</button></div>`;openModal()}
 function openAdd(type){let map={sale:["Add Sale",salesForm("m_s")],product:["Add Product",inventoryForm("m_p")],expense:["Add Expense",expenseForm("m_e")],customer:["Add Customer",customerForm("m_c")],task:["Add Task",taskForm("m_t")],doc:["Add Document",docForm("m_d")],team:["Add Team",teamForm("m_tm")]};document.getElementById("modalTitle").textContent=map[type][0];document.getElementById("modalBody").innerHTML=map[type][1];openModal()} function openModal(){document.getElementById("modal").classList.add("show")} function closeModal(){document.getElementById("modal").classList.remove("show")} function showPage(p){activePage=p;document.querySelectorAll(".page").forEach(s=>s.classList.add("hidden"));document.getElementById(p).classList.remove("hidden");document.querySelectorAll(".pageBtn").forEach(b=>b.classList.toggle("active",b.dataset.page===p));render()}
@@ -834,8 +799,6 @@ document.addEventListener("input",e=>{if(e.target.id==="search")render();});
 
 
 initRizSupabase();
-setTimeout(()=>loadCloudDocuments(true),1200);
-if(rizSB){ try{ rizSB.channel('riz-documents-live').on('postgres_changes',{event:'*',schema:'public',table:'documents'},()=>loadCloudDocuments(true)).subscribe(); }catch(e){console.warn(e)} }
 </script>
 </body>
 </html>
