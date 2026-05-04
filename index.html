@@ -646,6 +646,220 @@ document.addEventListener("change",e=>{let id=e.target.dataset.uploadMore;if(id)
 document.addEventListener("input",e=>{if(e.target.id==="search")render();});
 
 
+
+/* === RIZ DOCUMENT CLOUD SYNC PATCH V1 ===
+   This fixes phone upload not showing on PC.
+   It uploads files to Supabase Storage and saves document metadata to table riz_documents.
+*/
+const RIZ_DOC_BUCKET = "riz-documents";
+const RIZ_DOC_TABLE = "riz_documents";
+const RIZ_DOC_SETUP_SQL = `
+-- Run once in Supabase SQL Editor if document sync says table/bucket missing
+insert into storage.buckets (id, name, public)
+values ('riz-documents', 'riz-documents', true)
+on conflict (id) do update set public = true;
+
+create table if not exists public.riz_documents (
+  id uuid primary key default gen_random_uuid(),
+  doc_key text unique,
+  date text,
+  brand text,
+  name text,
+  type text,
+  status text,
+  note text,
+  files jsonb default '[]'::jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table public.riz_documents enable row level security;
+drop policy if exists "allow riz_documents all" on public.riz_documents;
+create policy "allow riz_documents all" on public.riz_documents for all using (true) with check (true);
+
+create policy if not exists "allow riz-documents storage select" on storage.objects for select using (bucket_id = 'riz-documents');
+create policy if not exists "allow riz-documents storage insert" on storage.objects for insert with check (bucket_id = 'riz-documents');
+create policy if not exists "allow riz-documents storage update" on storage.objects for update using (bucket_id = 'riz-documents') with check (bucket_id = 'riz-documents');
+create policy if not exists "allow riz-documents storage delete" on storage.objects for delete using (bucket_id = 'riz-documents');
+`;
+
+function rizDocSafePath(s){return String(s||'file').replace(/[^a-zA-Z0-9._-]+/g,'_').slice(0,120)}
+function rizDocCloudId(id){return String(id||'').startsWith('SBDOC-') ? String(id).replace('SBDOC-','') : null}
+function rizDocShowSetupAlert(err){
+  console.warn('Document sync setup needed:', err);
+  rizSetStatus('Document cloud sync setup needed', false);
+  const msg = 'Document sync needs Supabase table/storage setup. Open Console to copy SQL, or ask me for SQL setup file.\n\nError: ' + (err?.message || err || 'Unknown');
+  if(!window.__rizDocSetupShown){ window.__rizDocSetupShown=true; console.log('COPY THIS SQL FOR DOCUMENT SYNC:\n', RIZ_DOC_SETUP_SQL); alert(msg); }
+}
+
+async function rizUploadDocumentFile(file, brand){
+  if(!rizSB || !file) throw new Error('Supabase not connected');
+  const safeName = rizDocSafePath(file.name || 'document');
+  const path = `${rizDocSafePath(brand||'all')}/${Date.now()}_${Math.random().toString(36).slice(2)}_${safeName}`;
+  const { error } = await rizSB.storage.from(RIZ_DOC_BUCKET).upload(path, file, { upsert:false, contentType:file.type || 'application/octet-stream' });
+  if(error) throw error;
+  const { data: pub } = rizSB.storage.from(RIZ_DOC_BUCKET).getPublicUrl(path);
+  return { key:'sb:'+path, path, bucket:RIZ_DOC_BUCKET, url:pub.publicUrl, name:file.name, type:file.type||'file', size:file.size||0, cloud:true };
+}
+
+async function prepareFiles(list){
+  const files = Array.from(list||[]);
+  const out=[];
+  for(const f of files){
+    try{ out.push(await rizUploadDocumentFile(f, activeBrand==='all'?'all':activeBrand)); }
+    catch(err){
+      console.warn('Supabase Storage upload failed, using local fallback:', err);
+      let key='f_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+      await putFile(key,f);
+      out.push({key,name:f.name,type:f.type||'file',size:f.size||0,localOnly:true});
+      rizDocShowSetupAlert(err);
+    }
+  }
+  return out;
+}
+
+async function rizSaveDocCloud(doc){
+  if(!rizSB || !doc) return false;
+  const payload = {
+    doc_key: String(doc.id),
+    date: doc.date || today(),
+    brand: doc.brand || 'all',
+    name: doc.name || 'Document',
+    type: doc.type || '',
+    status: doc.status || 'Active',
+    note: doc.note || '',
+    files: doc.files || [],
+    updated_at: new Date().toISOString()
+  };
+  let q;
+  const cloudId = rizDocCloudId(doc.id);
+  if(cloudId) q = await rizSB.from(RIZ_DOC_TABLE).update(payload).eq('id', cloudId).select('id').single();
+  else q = await rizSB.from(RIZ_DOC_TABLE).upsert(payload, { onConflict:'doc_key' }).select('id').single();
+  if(q.error){ rizDocShowSetupAlert(q.error); return false; }
+  if(q.data?.id) doc.id = 'SBDOC-' + q.data.id;
+  localStorage.setItem(KEY, JSON.stringify(data));
+  rizSetStatus('Document synced to Supabase', true);
+  return true;
+}
+
+async function rizDeleteDocCloud(doc){
+  if(!rizSB || !doc) return;
+  for(const f of (doc.files||[])){
+    if(f.path) await rizSB.storage.from(RIZ_DOC_BUCKET).remove([f.path]).catch(()=>{});
+  }
+  const cloudId = rizDocCloudId(doc.id);
+  if(cloudId) await rizSB.from(RIZ_DOC_TABLE).delete().eq('id', cloudId);
+  else await rizSB.from(RIZ_DOC_TABLE).delete().eq('doc_key', String(doc.id));
+}
+
+async function rizPullDocumentsFromSupabase(){
+  if(!rizSB) return;
+  const {data:docs, error} = await rizSB.from(RIZ_DOC_TABLE).select('*').order('created_at', { ascending:false });
+  if(error){ console.warn('Document cloud pull skipped:', error); return; }
+  const cloudDocs = (docs||[]).map(d=>({
+    id:'SBDOC-'+d.id,
+    date:d.date || (d.created_at||'').slice(0,10) || today(),
+    brand:d.brand || 'all',
+    name:d.name || 'Document',
+    type:d.type || '',
+    status:d.status || 'Active',
+    note:d.note || '',
+    files:Array.isArray(d.files) ? d.files : []
+  }));
+  const localOnly = (data.documents||[]).filter(d=>!String(d.id).startsWith('SBDOC-') && !(d.files||[]).some(f=>f.cloud));
+  data.documents = [...cloudDocs, ...localOnly];
+  localStorage.setItem(KEY, JSON.stringify(data));
+  renderDocuments();
+}
+
+async function addDoc(p){
+  let brand=activeBrand==='all'?'all':activeBrand;
+  let o={id:'DOC-'+Date.now(),date:val(p+'date')||today(),brand,name:val(p+'name'),type:val(p+'type'),status:val(p+'status'),note:val(p+'note'),files:[]};
+  if(!o.name)return alert('Fill document title.');
+  try{
+    o.files=await prepareFiles(document.getElementById(p+'file').files);
+    data.documents.unshift(o);
+    await rizSaveDocCloud(o);
+    save();closeModal();render();
+  }catch(e){ console.error(e); alert('Upload failed: '+(e.message||e)); }
+}
+
+async function uploadMore(e,id){
+  let doc=data.documents.find(d=>String(d.id)===String(id));
+  if(!doc)return;
+  try{
+    doc.files = doc.files || [];
+    doc.files.push(...await prepareFiles(e.target.files));
+    await rizSaveDocCloud(doc);
+    save();render();
+  }catch(err){ console.error(err); alert('Upload failed: '+(err.message||err)); }
+}
+
+async function viewFile(id,i){
+  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];
+  if(!f)return;
+  if(f.url){ window.open(f.url, '_blank'); return; }
+  if(f.path && rizSB){ const {data:pub}=rizSB.storage.from(f.bucket||RIZ_DOC_BUCKET).getPublicUrl(f.path); window.open(pub.publicUrl,'_blank'); return; }
+  let blob=await getFile(f.key); if(!blob)return alert('File not found in browser. This was saved before cloud sync. Upload it again to sync across devices.');
+  let url=URL.createObjectURL(blob),w=window.open('');
+  if((f.type||'').startsWith('image/'))w.document.write(`<img src="${url}" style="max-width:100%;max-height:100vh;display:block;margin:auto">`);
+  else if((f.type||'').includes('pdf'))w.document.write(`<iframe src="${url}" style="border:0;width:100%;height:100vh"></iframe>`);
+  else w.document.write(`<a href="${url}" download="${esc(f.name)}">Download ${esc(f.name)}</a>`);
+}
+
+async function downloadFile(id,i){
+  let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i]; if(!f)return;
+  if(f.url || f.path){
+    const url=f.url || rizSB.storage.from(f.bucket||RIZ_DOC_BUCKET).getPublicUrl(f.path).data.publicUrl;
+    let a=document.createElement('a'); a.href=url; a.download=f.name||'document'; a.target='_blank'; a.click(); return;
+  }
+  let blob=await getFile(f.key); if(!blob)return alert('File not found in browser.');
+  let url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+
+async function removeFile(id,i){
+  let d=data.documents.find(x=>String(x.id)===String(id)); if(!d?.files?.[i])return;
+  if(confirm('Remove file?')){
+    const f=d.files[i];
+    if(f.path && rizSB) await rizSB.storage.from(f.bucket||RIZ_DOC_BUCKET).remove([f.path]).catch(()=>{});
+    else if(f.key) await delFile(f.key).catch(()=>{});
+    d.files.splice(i,1);
+    await rizSaveDocCloud(d);
+    save();render();
+  }
+}
+
+// Capture document delete to remove cloud files too
+(function(){
+  document.addEventListener('click', async function(e){
+    const del=e.target.closest('[data-del]');
+    if(!del) return;
+    const [t,id]=String(del.dataset.del||'').split(':');
+    if(t==='documents'){
+      e.preventDefault(); e.stopImmediatePropagation();
+      if(!confirm('Delete this document and cloud files?')) return;
+      const doc=data.documents.find(x=>String(x.id)===String(id));
+      if(doc) await rizDeleteDocCloud(doc);
+      data.documents=data.documents.filter(x=>String(x.id)!==String(id));
+      save(); render();
+    }
+  }, true);
+})();
+
+// Extend init and realtime for documents
+const __oldInitRizSupabase = initRizSupabase;
+function initRizSupabase(){
+  __oldInitRizSupabase();
+  setTimeout(()=>rizPullDocumentsFromSupabase(), 1200);
+  if(rizSB){
+    try{
+      rizSB.channel('riz-documents-live-sync')
+        .on('postgres_changes',{event:'*',schema:'public',table:RIZ_DOC_TABLE},()=>rizPullDocumentsFromSupabase())
+        .subscribe();
+    }catch(e){ console.warn(e); }
+  }
+}
+
 initRizSupabase();
 </script>
 </body>
