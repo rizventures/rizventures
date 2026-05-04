@@ -330,8 +330,8 @@ async function rizPushLocalChanges(){
     rizSaveSynced(); rizSetStatus("Saved to Supabase");
   }catch(err){ console.warn(err); rizSetStatus("Save local only - Supabase blocked", false); }
 }
-function rizSubscribeRealtime(){ if(!rizSB) return; rizSB.channel("riz-ventures-live-sync").on("postgres_changes",{event:"*",schema:"public",table:"sales"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"sales_items"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"orders"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"products"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"inventory"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"expenses"},()=>rizPullFromSupabase()).subscribe(); }
-function initRizSupabase(){ render(); if(!rizSB){ rizSetStatus("Supabase library failed", false); return; } rizSubscribeRealtime(); rizPullFromSupabase(); }
+function rizSubscribeRealtime(){ if(!rizSB) return; rizSB.channel("riz-ventures-live-sync").on("postgres_changes",{event:"*",schema:"public",table:"sales"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"sales_items"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"orders"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"products"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"inventory"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"expenses"},()=>rizPullFromSupabase()).on("postgres_changes",{event:"*",schema:"public",table:"documents"},()=>rizPullDocumentsFromCloud(true)).subscribe(); }
+function initRizSupabase(){ render(); if(!rizSB){ rizSetStatus("Supabase library failed", false); return; } rizSubscribeRealtime(); rizPullFromSupabase(); rizPullDocumentsFromCloud(false); }
 
 function slugifyBrandName(name){
   return String(name||"").toLowerCase().trim().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"") || ("brand_"+Date.now());
@@ -367,8 +367,73 @@ function openDB(){return new Promise((res,rej)=>{let r=indexedDB.open(DB,1);r.on
 async function putFile(k,b){let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readwrite");tx.objectStore(STORE).put(b,k);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
 async function getFile(k){let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readonly"),r=tx.objectStore(STORE).get(k);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
 async function delFile(k){let db=await openDB();return new Promise((res,rej)=>{let tx=db.transaction(STORE,"readwrite");tx.objectStore(STORE).delete(k);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
-async function prepareFiles(list){let out=[];for(const f of Array.from(list||[])){let key="f_"+Date.now()+"_"+Math.random().toString(36).slice(2);await putFile(key,f);out.push({key,name:f.name,type:f.type||"file",size:f.size||0})}return out}
+
 function size(s){if(!s)return"";if(s<1024)return s+" B";if(s<1048576)return(s/1024).toFixed(1)+" KB";return(s/1048576).toFixed(1)+" MB"}
+
+/* === CLOUD DOCUMENT STORAGE PATCH === */
+const RIZ_DOC_BUCKET = "documents";
+let rizDocsPulling = false;
+function rizDocBrandName(id){ return brandNames[id] || id || "All Brands"; }
+function rizSafePathName(s){ return String(s||"file").replace(/[^\w.\-() ]+/g,"_").replace(/\s+/g,"_").slice(0,120); }
+async function rizUploadFilesToCloud(list, brand){
+  if(!rizSB) throw new Error("Supabase not connected.");
+  let out=[];
+  for(const f of Array.from(list||[])){
+    const path = `${String(brand||"all").replace(/[^\w-]+/g,"_")}/${Date.now()}-${Math.random().toString(36).slice(2,8)}-${rizSafePathName(f.name)}`;
+    const up = await rizSB.storage.from(RIZ_DOC_BUCKET).upload(path, f, {cacheControl:"3600", upsert:false});
+    if(up.error) throw new Error("Storage upload failed: "+up.error.message);
+    const pub = rizSB.storage.from(RIZ_DOC_BUCKET).getPublicUrl(path);
+    out.push({key:path, storage_path:path, url:pub?.data?.publicUrl||"", name:f.name, type:f.type||"file", size:f.size||0, cloud:true});
+  }
+  return out;
+}
+async function prepareFiles(list, brand){
+  // Main Add Document now uploads to Supabase Storage, so phone and PC can see the same file.
+  if(rizSB){ return await rizUploadFilesToCloud(list, brand || activeBrand || "all"); }
+  // Fallback only if Supabase library fails.
+  let out=[];for(const f of Array.from(list||[])){let key="f_"+Date.now()+"_"+Math.random().toString(36).slice(2);await putFile(key,f);out.push({key,name:f.name,type:f.type||"file",size:f.size||0})}return out;
+}
+async function rizInsertDocumentCloud(doc){
+  if(!rizSB) return null;
+  const row={
+    brand: doc.brand || "all",
+    brand_name: rizDocBrandName(doc.brand),
+    date: doc.date || today(),
+    name: doc.name || "Document",
+    type: doc.type || "",
+    status: doc.status || "Active",
+    note: doc.note || "",
+    files: doc.files || [],
+    file_url: doc.files?.[0]?.url || "",
+    url: doc.files?.[0]?.url || "",
+    storage_path: doc.files?.[0]?.storage_path || doc.files?.[0]?.key || "",
+    created_at: new Date().toISOString()
+  };
+  const res=await rizSB.from("documents").insert(row).select("*").single();
+  if(res.error) throw new Error("Database save failed: "+res.error.message);
+  return res.data;
+}
+function rizMapCloudDoc(d){
+  let files=[];
+  if(Array.isArray(d.files)) files=d.files;
+  else if(d.file_url||d.url) files=[{name:d.file_name||d.name||"Document",url:d.file_url||d.url,storage_path:d.storage_path||"",key:d.storage_path||"",type:d.file_type||"file",size:d.size||0,cloud:true}];
+  return {id:"DBDOC-"+d.id,date:String(d.date||d.created_at||"").slice(0,10)||today(),brand:d.brand||"all",name:d.name||d.file_name||"Document",type:d.type||d.file_type||"",status:d.status||"Active",note:d.note||"",files};
+}
+async function rizPullDocumentsFromCloud(shouldRender=false){
+  if(!rizSB || rizDocsPulling) return;
+  rizDocsPulling=true;
+  try{
+    const res=await rizSB.from("documents").select("*").order("created_at",{ascending:false});
+    if(res.error) throw res.error;
+    const dbDocs=(res.data||[]).map(rizMapCloudDoc);
+    const localDocs=(data.documents||[]).filter(x=>!String(x.id).startsWith("DBDOC-"));
+    data.documents=[...dbDocs,...localDocs];
+    localStorage.setItem(KEY,JSON.stringify(data));
+    if(shouldRender && activePage==="documents") renderDocuments();
+  }catch(err){ console.warn("Document cloud pull failed",err); }
+  finally{ rizDocsPulling=false; }
+}
+
 
 function statData(){let s=rows("sales"),e=rows("expenses"),p=rows("products");let rev=s.filter(x=>x.status==="Paid").reduce((a,b)=>a+Number(b.amount||0),0), exp=e.filter(x=>x.status==="Paid").reduce((a,b)=>a+Number(b.amount||0),0), stock=p.reduce((a,b)=>a+Number(b.stock||0)*Number(b.cost||0),0); return {rev,exp,net:rev-exp,stock,count:s.length}}
 function statCards(){let s=statData();return`<div class="gridStats"><div class="stat"><small>Paid Revenue</small><b>${money(s.rev)}</b></div><div class="stat"><small>Paid Expenses</small><b>${money(s.exp)}</b></div><div class="stat"><small>Net Cash</small><b>${money(s.net)}</b></div><div class="stat"><small>Stock Capital</small><b>${money(s.stock)}</b></div><div class="stat"><small>Sales Count</small><b>${s.count}</b></div></div>`}
@@ -457,8 +522,23 @@ function addTask(p){let brand=activeBrand==="all"?"all":activeBrand;let o={id:Da
 function renderTasks(){document.getElementById("tasks").innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Task</h3></div><div class="panelBody">${taskForm("t")}</div></div><div class="panel"><div class="panelHead"><h3>Tasks</h3></div><div class="panelBody">${rows("tasks").map(taskCard).join("")||empty("No tasks")}</div></div>`} function taskCard(x){return`<div class="taskCard"><div><div class="fileName" style="${x.done?'text-decoration:line-through;color:#999':''}">${esc(x.title)}</div><div class="meta">${brandNames[x.brand]} • Due: ${x.due||"-"} • ${badge(x.priority)} ${x.done?badge("Done"):""}</div></div><div class="actions"><button class="iconBtn" data-toggle-task="${x.id}">${x.done?"Undo":"Done"}</button><button class="btn danger" data-del="tasks:${x.id}">Delete</button></div></div>`}
 
 function docForm(p){return`<div class="formGrid"><input id="${p}date" type="date" value="${today()}"><input id="${p}name" placeholder="Document title"><input id="${p}type" placeholder="Type"><select id="${p}status"><option>Active</option><option>Draft</option><option>Pending</option></select><input id="${p}note" placeholder="Note / link"><input id="${p}file" type="file" multiple><button class="btn primary" data-add-doc="${p}">Add Document</button></div>`}
-async function addDoc(p){let brand=activeBrand==="all"?"all":activeBrand;let o={id:Date.now(),date:val(p+"date")||today(),brand,name:val(p+"name"),type:val(p+"type"),status:val(p+"status"),note:val(p+"note"),files:[]};if(!o.name)return alert("Fill document title.");try{o.files=await prepareFiles(document.getElementById(p+"file").files);data.documents.unshift(o);save();closeModal();render()}catch(e){alert("Upload failed. Try smaller file.")}}
-function renderDocuments(){document.getElementById("documents").innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Document</h3></div><div class="panelBody">${docForm("d")}</div></div><div class="panel"><div class="panelHead"><h3>Documents</h3><button class="btn ghost" data-export="documents">Export CSV</button></div><div class="panelBody">${docTable(rows("documents"))}</div></div>`}
+async function addDoc(p){
+  let brand=activeBrand==="all"?"all":activeBrand;
+  let o={id:Date.now(),date:val(p+"date")||today(),brand,name:val(p+"name"),type:val(p+"type"),status:val(p+"status"),note:val(p+"note"),files:[]};
+  if(!o.name)return alert("Fill document title.");
+  try{
+    o.files=await prepareFiles(document.getElementById(p+"file").files, brand);
+    const cloud=await rizInsertDocumentCloud(o);
+    if(cloud) o=rizMapCloudDoc(cloud);
+    data.documents.unshift(o);
+    localStorage.setItem(KEY,JSON.stringify(data));
+    closeModal();
+    await rizPullDocumentsFromCloud(false);
+    render();
+    rizSetStatus("Document uploaded to cloud");
+  }catch(e){console.error(e);alert("Upload failed: "+(e.message||"Try smaller file / check Storage policy."));}
+}
+function renderDocuments(){document.getElementById("documents").innerHTML=`<div class="panel"><div class="panelHead"><h3>Add Document</h3><span class="badge paid">Cloud Sync</span></div><div class="panelBody">${docForm("d")}</div></div><div class="panel"><div class="panelHead"><h3>Documents</h3><button class="btn ghost" onclick="rizPullDocumentsFromCloud(true)">Refresh Cloud</button><button class="btn ghost" data-export="documents">Export CSV</button></div><div class="panelBody">${docTable(rows("documents"))}</div></div>`; setTimeout(()=>rizPullDocumentsFromCloud(false),300)}
 function docTable(r){if(!r.length)return empty("No documents");return r.map(x=>`<div class="fileCard"><div style="display:flex;gap:12px"><img class="miniLogo" src="${logos[x.brand||"all"]}"><div><div class="fileName">${esc(x.name)}</div><div class="meta">${x.date} • ${brandNames[x.brand]} • ${esc(x.type||"-")} • ${badge(x.status)}</div><div class="meta">${esc(x.note||"")}</div><div class="meta">${x.files?.length?`<b>${x.files.length} file(s):</b> ${x.files.map(f=>esc(f.name)+" "+size(f.size)).join(", ")}`:"No file uploaded"}</div><div class="actions" style="margin-top:9px">${(x.files||[]).map((f,i)=>`<button class="iconBtn" data-view-file="${x.id}:${i}">View ${i+1}</button><button class="iconBtn" data-download-file="${x.id}:${i}">Download</button><button class="btn danger" data-remove-file="${x.id}:${i}">Remove</button>`).join("")}</div></div></div><div class="actions"><label class="iconBtn">Upload More<input type="file" hidden multiple data-upload-more="${x.id}"></label><button class="iconBtn" data-edit="documents:${x.id}">Edit</button><button class="btn danger" data-del="documents:${x.id}">Delete</button></div></div>`).join("")}
 async function uploadMore(e,id){let doc=data.documents.find(d=>String(d.id)===String(id));if(!doc)return;try{doc.files.push(...await prepareFiles(e.target.files));save();render()}catch(err){alert("Upload failed")}} async function viewFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;let blob=await getFile(f.key);if(!blob)return alert("File not found in browser.");let url=URL.createObjectURL(blob),w=window.open("");if((f.type||"").startsWith("image/"))w.document.write(`<img src="${url}" style="max-width:100%;max-height:100vh;display:block;margin:auto">`);else if((f.type||"").includes("pdf"))w.document.write(`<iframe src="${url}" style="border:0;width:100%;height:100vh"></iframe>`);else w.document.write(`<a href="${url}" download="${esc(f.name)}">Download ${esc(f.name)}</a>`)} async function downloadFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id)),f=d?.files?.[i];if(!f)return;let blob=await getFile(f.key);let url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)} async function removeFile(id,i){let d=data.documents.find(x=>String(x.id)===String(id));if(!d?.files?.[i])return;if(confirm("Remove file?")){await delFile(d.files[i].key);d.files.splice(i,1);save();render()}}
 
@@ -607,7 +687,22 @@ async function saveEdit(t,id){
   closeModal();render();return;
  }
  Object.keys(x).filter(k=>k!=="id"&&k!=="files").forEach(k=>{let vv=val("edit_"+k);x[k]=(!isNaN(vv)&&vv!=="")?Number(vv):vv});save();closeModal();render()
-} function del(t,id){if(confirm("Delete this record?")){data[t]=data[t].filter(x=>String(x.id)!==String(id));save();render()}} function toggleTask(id){let t=data.tasks.find(x=>String(x.id)===String(id));if(t){t.done=!t.done;save();render()}}
+} async function del(t,id){
+  if(!confirm("Delete this record?")) return;
+  if(t==="documents"){
+    const doc=data.documents.find(x=>String(x.id)===String(id));
+    try{
+      if(doc?.files?.length && rizSB){
+        const paths=doc.files.map(f=>f.storage_path||f.key).filter(Boolean).filter(p=>!String(p).startsWith("f_"));
+        if(paths.length) await rizSB.storage.from(RIZ_DOC_BUCKET).remove(paths);
+      }
+      if(String(id).startsWith("DBDOC-") && rizSB) await rizSB.from("documents").delete().eq("id",String(id).replace("DBDOC-",""));
+    }catch(e){console.warn(e)}
+  }
+  data[t]=data[t].filter(x=>String(x.id)!==String(id));
+  localStorage.setItem(KEY,JSON.stringify(data));
+  render();
+} function toggleTask(id){let t=data.tasks.find(x=>String(x.id)===String(id));if(t){t.done=!t.done;save();render()}}
 
 function openQuick(){document.getElementById("modalTitle").textContent="Quick Add";document.getElementById("modalBody").innerHTML=`<div class="cards"><button class="btn primary" data-open="sale">Add Sale</button><button class="btn primary" data-open="product">Add Product</button><button class="btn primary" data-open="expense">Add Expense</button><button class="btn primary" data-open="customer">Add Customer</button><button class="btn primary" data-open="task">Add Task</button><button class="btn primary" data-open="doc">Add Document</button><button class="btn primary" data-open="team">Add Team</button></div>`;openModal()}
 function openAdd(type){let map={sale:["Add Sale",salesForm("m_s")],product:["Add Product",inventoryForm("m_p")],expense:["Add Expense",expenseForm("m_e")],customer:["Add Customer",customerForm("m_c")],task:["Add Task",taskForm("m_t")],doc:["Add Document",docForm("m_d")],team:["Add Team",teamForm("m_tm")]};document.getElementById("modalTitle").textContent=map[type][0];document.getElementById("modalBody").innerHTML=map[type][1];openModal()} function openModal(){document.getElementById("modal").classList.add("show")} function closeModal(){document.getElementById("modal").classList.remove("show")} function showPage(p){activePage=p;document.querySelectorAll(".page").forEach(s=>s.classList.add("hidden"));document.getElementById(p).classList.remove("hidden");document.querySelectorAll(".pageBtn").forEach(b=>b.classList.toggle("active",b.dataset.page===p));render()}
@@ -648,275 +743,5 @@ document.addEventListener("input",e=>{if(e.target.id==="search")render();});
 
 initRizSupabase();
 </script>
-
-<style>
-/* RIZ CLOUD DOCUMENT SYNC PANEL */
-.riz-doc-floating-btn{
-  position:fixed; right:18px; bottom:76px; z-index:99998;
-  border:0; border-radius:999px; padding:13px 16px; font-weight:900;
-  background:#111827; color:white; box-shadow:0 10px 30px rgba(0,0,0,.22);
-  cursor:pointer;
-}
-.riz-doc-panel{
-  position:fixed; right:18px; bottom:132px; width:min(420px, calc(100vw - 24px));
-  max-height:70vh; overflow:hidden; display:none; flex-direction:column;
-  background:white; z-index:99999; border-radius:24px; box-shadow:0 18px 55px rgba(0,0,0,.28);
-  border:1px solid rgba(15,23,42,.08); font-family:inherit;
-}
-.riz-doc-panel.open{display:flex;}
-.riz-doc-head{padding:18px 18px 12px; background:#111827; color:white;}
-.riz-doc-head h3{margin:0; font-size:1.1rem;}
-.riz-doc-head p{margin:5px 0 0; color:#cbd5e1; font-size:.8rem; font-weight:700;}
-.riz-doc-body{padding:14px; overflow-y:auto;}
-.riz-doc-upload-box{
-  border:2px dashed #f97316; background:#fff7ed; border-radius:18px; padding:14px; margin-bottom:12px;
-}
-.riz-doc-upload-box input,.riz-doc-upload-box select{
-  width:100%; padding:10px; border-radius:12px; border:1px solid #fed7aa; margin-bottom:8px; font-weight:800;
-}
-.riz-doc-upload-box button,.riz-doc-refresh{
-  width:100%; border:0; border-radius:13px; padding:12px; font-weight:900; background:#f97316; color:white; cursor:pointer;
-}
-.riz-doc-refresh{background:#111827; margin-bottom:10px;}
-.riz-doc-status{font-size:.78rem; font-weight:900; color:#64748b; margin:8px 0;}
-.riz-doc-list{display:flex; flex-direction:column; gap:10px;}
-.riz-doc-card{border:1px solid #e5e7eb; border-radius:16px; padding:12px; background:#f8fafc;}
-.riz-doc-card b{display:block; color:#111827; word-break:break-word;}
-.riz-doc-card small{display:block; color:#64748b; font-weight:800; margin:5px 0 9px;}
-.riz-doc-actions{display:flex; gap:8px; flex-wrap:wrap;}
-.riz-doc-actions a,.riz-doc-actions button{
-  border:0; border-radius:10px; padding:8px 10px; font-size:.78rem; font-weight:900; text-decoration:none; cursor:pointer;
-}
-.riz-doc-actions a{background:#111827; color:white;}
-.riz-doc-actions button{background:#ef4444; color:white;}
-@media(max-width:700px){
-  .riz-doc-panel{right:8px; left:8px; bottom:118px; width:auto; max-height:72vh;}
-  .riz-doc-floating-btn{right:12px; bottom:74px;}
-}
-</style>
-
-<button class="riz-doc-floating-btn" onclick="toggleRizDocPanel()">📁 Documents</button>
-
-<div id="riz-doc-panel" class="riz-doc-panel">
-  <div class="riz-doc-head">
-    <h3>Cloud Documents</h3>
-    <p>Upload sini akan sync phone ↔ PC melalui Supabase Storage.</p>
-  </div>
-  <div class="riz-doc-body">
-    <div class="riz-doc-upload-box">
-      <select id="riz-doc-brand">
-        <option value="All Brands">All Brands</option>
-        <option value="CRAVO FRIED CHICKEN">CRAVO FRIED CHICKEN</option>
-        <option value="CRUNCH LAB">CRUNCH LAB</option>
-        <option value="KAVYX">KAVYX</option>
-        <option value="SDERLLA VECTOR PRINT">SDERLLA VECTOR PRINT</option>
-      </select>
-      <input id="riz-doc-file" type="file" multiple />
-      <button onclick="uploadRizDocuments()">UPLOAD TO CLOUD</button>
-      <div id="riz-doc-status" class="riz-doc-status">Ready.</div>
-    </div>
-    <button class="riz-doc-refresh" onclick="loadRizDocuments()">🔄 Refresh Documents</button>
-    <div id="riz-doc-list" class="riz-doc-list"></div>
-  </div>
-</div>
-
-<script>
-/* RIZ SUPABASE STORAGE DOCUMENT SYNC - FINAL */
-(function(){
-  const RIZ_SUPABASE_URL = "https://jtgiswzolnretpezfxpc.supabase.co";
-  const RIZ_SUPABASE_KEY = "sb_publishable_9m30QqCS2ttu9td6F84ogQ_JizwPY3v";
-  const BUCKET_NAME = "documents";
-
-  let rizDb = null;
-
-  function getDb(){
-    if (rizDb) return rizDb;
-    if (window.supabase && window.supabase.createClient) {
-      rizDb = window.supabase.createClient(RIZ_SUPABASE_URL, RIZ_SUPABASE_KEY);
-      return rizDb;
-    }
-    if (window.db && window.db.from) {
-      rizDb = window.db;
-      return rizDb;
-    }
-    throw new Error("Supabase client not loaded. Make sure internet is on and open with localhost/GitHub Pages.");
-  }
-
-  function setDocStatus(msg, isError=false){
-    const el = document.getElementById("riz-doc-status");
-    if (el) {
-      el.textContent = msg;
-      el.style.color = isError ? "#ef4444" : "#64748b";
-    }
-    console[isError ? "error" : "log"](msg);
-  }
-
-  function safeFileName(name){
-    return String(name || "file")
-      .replace(/[^\w.\-() ]+/g, "_")
-      .replace(/\s+/g, "_")
-      .slice(0, 120);
-  }
-
-  window.toggleRizDocPanel = function(){
-    const panel = document.getElementById("riz-doc-panel");
-    if (!panel) return;
-    panel.classList.toggle("open");
-    if (panel.classList.contains("open")) loadRizDocuments();
-  };
-
-  async function saveDocumentRecord(record){
-    const db = getDb();
-
-    // Try common table: documents
-    let res = await db.from("documents").insert(record).select().single();
-
-    if (!res.error) return res.data;
-
-    // If table schema uses different file_url / name still included by SQL we give.
-    throw res.error;
-  }
-
-  window.uploadRizDocuments = async function(){
-    try{
-      const db = getDb();
-      const input = document.getElementById("riz-doc-file");
-      const brand = document.getElementById("riz-doc-brand")?.value || "All Brands";
-      const files = Array.from(input?.files || []);
-
-      if (!files.length) {
-        alert("Choose file first.");
-        return;
-      }
-
-      setDocStatus("Uploading " + files.length + " file(s)...");
-
-      let success = 0;
-
-      for (const file of files){
-        const cleanName = safeFileName(file.name);
-        const path = brand.replace(/[^\w\-]+/g, "_") + "/" + Date.now() + "-" + Math.random().toString(36).slice(2,8) + "-" + cleanName;
-
-        const upload = await db.storage
-          .from(BUCKET_NAME)
-          .upload(path, file, { cacheControl: "3600", upsert: false });
-
-        if (upload.error) {
-          throw new Error("Storage upload failed: " + upload.error.message + ". Make sure bucket 'documents' exists and is public.");
-        }
-
-        const publicData = db.storage.from(BUCKET_NAME).getPublicUrl(path);
-        const publicUrl = publicData?.data?.publicUrl || "";
-
-        const record = {
-          brand: brand,
-          name: file.name,
-          file_name: file.name,
-          file_url: publicUrl,
-          url: publicUrl,
-          storage_path: path,
-          file_type: file.type || "",
-          size: file.size || 0,
-          created_at: new Date().toISOString()
-        };
-
-        await saveDocumentRecord(record);
-        success++;
-      }
-
-      input.value = "";
-      setDocStatus("Uploaded " + success + " file(s) to cloud.");
-      await loadRizDocuments();
-
-    }catch(err){
-      console.error(err);
-      setDocStatus(err.message || String(err), true);
-      alert("Upload failed: " + (err.message || String(err)));
-    }
-  };
-
-  window.loadRizDocuments = async function(){
-    const list = document.getElementById("riz-doc-list");
-    if (!list) return;
-
-    try{
-      const db = getDb();
-      setDocStatus("Loading cloud documents...");
-
-      const { data, error } = await db
-        .from("documents")
-        .select("*")
-        .order("created_at", { ascending:false });
-
-      if (error) throw error;
-
-      const docs = data || [];
-      if (!docs.length){
-        list.innerHTML = '<div class="riz-doc-card"><b>No cloud document yet.</b><small>Upload first file from phone/PC.</small></div>';
-        setDocStatus("No documents yet.");
-        return;
-      }
-
-      list.innerHTML = docs.map(doc => {
-        const name = doc.name || doc.file_name || "Document";
-        const url = doc.file_url || doc.url || "#";
-        const brand = doc.brand || "All Brands";
-        const date = doc.created_at ? new Date(doc.created_at).toLocaleString() : "";
-        const id = doc.id || "";
-        const storagePath = doc.storage_path || "";
-        return `
-          <div class="riz-doc-card">
-            <b>${name}</b>
-            <small>${brand} • ${date}</small>
-            <div class="riz-doc-actions">
-              <a href="${url}" target="_blank" rel="noopener">OPEN</a>
-              <a href="${url}" download>DOWNLOAD</a>
-              ${id ? `<button onclick="deleteRizDocument('${id}','${storagePath.replace(/'/g, "\\'")}')">DELETE</button>` : ""}
-            </div>
-          </div>
-        `;
-      }).join("");
-
-      setDocStatus("Loaded " + docs.length + " cloud document(s).");
-
-    }catch(err){
-      console.error(err);
-      list.innerHTML = '<div class="riz-doc-card"><b>Cannot load documents.</b><small>' + (err.message || String(err)) + '</small></div>';
-      setDocStatus("Load failed: " + (err.message || String(err)), true);
-    }
-  };
-
-  window.deleteRizDocument = async function(id, storagePath){
-    if (!confirm("Delete this cloud document?")) return;
-
-    try{
-      const db = getDb();
-
-      if (storagePath) {
-        await db.storage.from(BUCKET_NAME).remove([storagePath]);
-      }
-
-      const { error } = await db.from("documents").delete().eq("id", id);
-      if (error) throw error;
-
-      setDocStatus("Document deleted.");
-      await loadRizDocuments();
-
-    }catch(err){
-      console.error(err);
-      setDocStatus("Delete failed: " + (err.message || String(err)), true);
-      alert("Delete failed: " + (err.message || String(err)));
-    }
-  };
-
-  document.addEventListener("DOMContentLoaded", function(){
-    setTimeout(function(){
-      try { getDb(); loadRizDocuments(); }
-      catch(e){ setDocStatus(e.message, true); }
-    }, 800);
-  });
-})();
-</script>
-
 </body>
 </html>
