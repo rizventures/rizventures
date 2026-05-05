@@ -710,7 +710,49 @@ async function saveEdit(t,id){
   closeModal();render();return;
  }
  Object.keys(x).filter(k=>k!=="id"&&k!=="files").forEach(k=>{let vv=val("edit_"+k);x[k]=(!isNaN(vv)&&vv!=="")?Number(vv):vv});save();closeModal();render()
-} function del(t,id){if(confirm("Delete this record?")){data[t]=data[t].filter(x=>String(x.id)!==String(id));save();render()}} function toggleTask(id){let t=data.tasks.find(x=>String(x.id)===String(id));if(t){t.done=!t.done;save();render()}}
+} async function del(t,id){
+  if(!confirm("Delete this record?")) return;
+
+  try{
+    if(t==="documents"){
+      const doc=(data.documents||[]).find(x=>String(x.id)===String(id));
+
+      if(doc && rizSB){
+        // Remove file from Supabase Storage if available
+        for(const f of (doc.files||[])){
+          const path=f.storage_path || f.key || "";
+          if(path && !String(path).startsWith("f_") && !String(path).startsWith("http")){
+            try{ await rizSB.storage.from("documents").remove([path]); }
+            catch(e){ console.warn("Storage delete warning:", e); }
+          }
+        }
+
+        // Delete document row from Supabase table
+        if(String(doc.id||"").startsWith("DBDOC-")){
+          const dbid=String(doc.id).replace("DBDOC-","");
+          const {error}=await rizSB.from("documents").delete().eq("id",dbid);
+          if(error) throw error;
+        }else{
+          // fallback if document was inserted with local id
+          const {error}=await rizSB.from("documents").delete().eq("local_id",String(doc.id));
+          if(error) throw error;
+        }
+      }
+    }
+
+    data[t]=data[t].filter(x=>String(x.id)!==String(id));
+    save();
+
+    if(t==="documents" && typeof rizLoadCloudDocumentsSafe==="function"){
+      await rizLoadCloudDocumentsSafe();
+    }
+
+    render();
+  }catch(err){
+    console.error("Delete failed:",err);
+    alert("Delete failed: "+(err.message||String(err)));
+  }
+} function toggleTask(id){let t=data.tasks.find(x=>String(x.id)===String(id));if(t){t.done=!t.done;save();render()}}
 
 function openQuick(){document.getElementById("modalTitle").textContent="Quick Add";document.getElementById("modalBody").innerHTML=`<div class="cards"><button class="btn primary" data-open="sale">Add Sale</button><button class="btn primary" data-open="product">Add Product</button><button class="btn primary" data-open="expense">Add Expense</button><button class="btn primary" data-open="customer">Add Customer</button><button class="btn primary" data-open="task">Add Task</button><button class="btn primary" data-open="doc">Add Document</button><button class="btn primary" data-open="team">Add Team</button></div>`;openModal()}
 function openAdd(type){let map={sale:["Add Sale",salesForm("m_s")],product:["Add Product",inventoryForm("m_p")],expense:["Add Expense",expenseForm("m_e")],customer:["Add Customer",customerForm("m_c")],task:["Add Task",taskForm("m_t")],doc:["Add Document",docForm("m_d")],team:["Add Team",teamForm("m_tm")]};document.getElementById("modalTitle").textContent=map[type][0];document.getElementById("modalBody").innerHTML=map[type][1];openModal()} function openModal(){document.getElementById("modal").classList.add("show")} function closeModal(){document.getElementById("modal").classList.remove("show")} function showPage(p){activePage=p;document.querySelectorAll(".page").forEach(s=>s.classList.add("hidden"));document.getElementById(p).classList.remove("hidden");document.querySelectorAll(".pageBtn").forEach(b=>b.classList.toggle("active",b.dataset.page===p));render()}
