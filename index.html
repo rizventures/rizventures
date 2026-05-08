@@ -136,7 +136,7 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute
     <label class="navBtn">⬆️ Import Backup<input id="importBackup" type="file" accept=".json" hidden></label>
   </aside>
   <main class="main">
-    <div class="notice"><div><b>RIZ Ventures Command Center</b><br><small>Premium internal system. All data auto-saves in this browser.</small></div><button class="btn ghost" id="quickAdd">+ Quick Add</button></div>
+    <div class="notice"><div><b>RIZ Ventures Command Center</b><br><small>Premium internal system. Firebase sync ready.</small></div><button class="btn ghost" id="quickAdd">+ Quick Add</button></div>
     <header class="header">
       <div class="headerLeft"><img id="workspaceLogo" class="workspaceLogo"><div><small>Selected Workspace</small><h2 id="workspaceTitle">All Brands</h2></div></div>
       <div class="headerActions"><input id="search" class="search" placeholder="Search anything..."><button class="btn ghost" id="clearSearch">Clear Search</button></div>
@@ -164,7 +164,7 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute
    Paste your Firebase web config below.
    Firebase Console > Project settings > Your apps > Web app
 ===================================================== */
-const firebaseConfig = {
+const FIREBASE_CONFIG = {
   apiKey: "AIzaSyDEUvNHCl7AE9BuOPSQyZbC7k3OVBoPjUg",
   authDomain: "riz-ventures.firebaseapp.com",
   projectId: "riz-ventures",
@@ -177,7 +177,7 @@ const firebaseConfig = {
 (function(){
   if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
   const fs = firebase.firestore();
-  const st = firebase.storage();
+  const st = firebase.storage ? firebase.storage() : null;
 
   function docToRow(doc){ return { id: doc.id, ...doc.data() }; }
   function cleanRow(row){
@@ -193,8 +193,8 @@ const firebaseConfig = {
     eq(field,value){ this.filters.push([field,value]); return this; }
     order(field,opt={}){ this.orders.push([field, !!opt.ascending]); return this; }
     limit(n){ this._limit=n; return this; }
-    single(){ this._single=true; return this.then(r=>r.data); }
-    maybeSingle(){ this._maybe=true; return this.then(r=>r.data); }
+    single(){ this._single=true; return this; }
+    maybeSingle(){ this._maybe=true; return this; }
     insert(payload){ this.action='insert'; this.payload=payload; return this; }
     upsert(payload){ this.action='upsert'; this.payload=payload; return this; }
     update(payload){ this.action='update'; this.payload=payload; return this; }
@@ -202,10 +202,19 @@ const firebaseConfig = {
     async _runSelect(){
       let q = fs.collection(this.table);
       this.filters.forEach(([f,v]) => { q = q.where(f, '==', v); });
-      this.orders.forEach(([f,asc]) => { try { q = q.orderBy(f, asc ? 'asc' : 'desc'); } catch(e){} });
-      if (this._limit) q = q.limit(this._limit);
       const snap = await q.get();
       let rows = snap.docs.map(docToRow);
+      if (this.orders.length) {
+        rows.sort((a,b)=>{
+          for (const [f,asc] of this.orders) {
+            const av = a[f] ?? ''; const bv = b[f] ?? '';
+            const cmp = String(av).localeCompare(String(bv), undefined, {numeric:true, sensitivity:'base'});
+            if (cmp !== 0) return asc ? cmp : -cmp;
+          }
+          return 0;
+        });
+      }
+      if (this._limit) rows = rows.slice(0, this._limit);
       if (this._single || this._maybe) return rows[0] || null;
       return rows;
     }
@@ -261,9 +270,9 @@ const firebaseConfig = {
       channel(){ return { on(){return this;}, subscribe(){return this;} }; },
       storage: {
         from(bucket){ return {
-          async upload(path,file,opt={}){ try{ const ref = st.ref().child(bucket+'/'+path); await ref.put(file); return {data:{path}, error:null}; }catch(e){ return {data:null,error:e}; } },
+          async upload(path,file,opt={}){ try{ if(!st) throw new Error('Firebase Storage disabled. Use Cloudinary/local image for now.'); const ref = st.ref().child(bucket+'/'+path); await ref.put(file); return {data:{path}, error:null}; }catch(e){ return {data:null,error:e}; } },
           getPublicUrl(path){ return {data:{publicUrl:`https://firebasestorage.googleapis.com/v0/b/${FIREBASE_CONFIG.storageBucket}/o/${encodeURIComponent(bucket+'/'+path)}?alt=media`}}; },
-          async remove(paths){ try{ for(const p of paths||[]) await st.ref().child(bucket+'/'+p).delete(); return {data:true,error:null}; }catch(e){ return {data:null,error:e}; } }
+          async remove(paths){ try{ if(!st) return {data:true,error:null}; for(const p of paths||[]) await st.ref().child(bucket+'/'+p).delete(); return {data:true,error:null}; }catch(e){ return {data:null,error:e}; } }
         }; }
       }
     };
